@@ -1,0 +1,193 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * @file CommandMgr.cpp
+ * @brief GM command localization management
+ *
+ * This file implements CommandMgr, which manages localized help text
+ * for GM commands. It loads translations from the `locales_command`
+ * database table and provides lookup services for command help strings.
+ *
+ * Features:
+ * - Multi-language command help support
+ * - Database-driven localization
+ * - Memory-efficient storage with vector indexing
+ *
+ * @see CommandMgr for singleton interface
+ * @see ChatCommand for command structure
+ */
+
+/*
+ * Copyright (C) 2015-2026 MaNGOS <https://www.getmangos.eu>
+ * Copyright (C) 2008-2015 TrinityCore <http://www.trinitycore.org/>
+ * Copyright (C) 2005-2009 MaNGOS <http://getmangos.com/>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2 of the License, or (at your
+ * option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "Platform/Define.h"
+#include "Common/Locales.h"
+#include "SharedDefines.h"
+#include "Policies/Singleton.h"
+#include "ObjectGuid.h"
+#include "Language.h"
+#include "CommandMgr.h"
+#include "ObjectMgr.h"
+#include "ProgressBar.h"
+#include <string>
+
+class ChatCommand; // Forward declaration
+
+
+/**
+ * @brief Construct CommandMgr singleton
+ *
+ * Initializes the command manager. Database loading is deferred
+ * to LoadCommandHelpLocale().
+ */
+CommandMgr::CommandMgr() {}
+
+/**
+ * @brief Destroy CommandMgr singleton
+ *
+ * Cleans up loaded locale data. The map is automatically cleared
+ * by the destructor.
+ */
+CommandMgr::~CommandMgr() {}
+
+/**
+ * @brief Load localized command help text from database
+ *
+ * Loads all localized help strings from the `locales_command` table.
+ * Each command ID can have up to 8 localized help text strings.
+ * The data is stored in a map indexed by command ID with vectors
+ * for each locale.
+ *
+ * Database columns:
+ * - id: Command identifier
+ * - help_text_loc1-8: Help text for each locale (1=enUS, 2=koKR, etc.)
+ *
+ * @note Called during server startup
+ * @todo Consider merging with ObjectMgr as this relates to game objects
+ */
+void CommandMgr::LoadCommandHelpLocale()
+{
+    m_CommandHelpLocaleMap.clear();
+
+    uint32 count=0;
+
+    QueryResult* result = WorldDatabase.Query("SELECT "
+        "`id`,"
+        "`help_text_loc1`,"
+        "`help_text_loc2`,"
+        "`help_text_loc3`,"
+        "`help_text_loc4`,"
+        "`help_text_loc5`,"
+        "`help_text_loc6`,"
+        "`help_text_loc7`,"
+        "`help_text_loc8`"
+        " FROM `locales_command` ORDER BY `id` ASC "
+    );
+
+    if (!result)
+    {
+        sLog.outString();
+        sLog.outString(">> Loaded 0 locales command help definitions. DB table `locales_command` is empty.");
+        return;
+    }
+
+    BarGoLink bar(result->GetRowCount());
+
+    do
+    {
+        Field* fields = result->Fetch();
+        bar.step();
+
+        uint32 commandId = fields[0].GetUInt32(); // to assign with db data
+
+        CommandHelpLocale& data = m_CommandHelpLocaleMap[commandId];
+        for (int i = 1; i < MAX_LOCALE; ++i)
+        {
+            std::string str = fields[i].GetCppString();
+            if (!str.empty())
+            {
+                int idx = sObjectMgr.GetOrNewIndexForLocale(LocaleConstant(i));
+                if (idx >= 0)
+                {
+                    if ((int32)data.HelpText.size() <= idx)
+                    {
+                        data.HelpText.resize(idx + 1);
+                    }
+                    data.HelpText[idx] = str;
+                }
+            }
+        }
+
+        ++count;
+    } while (result->NextRow());
+
+    sLog.outString();
+    sLog.outString(">> Loaded %u locale command help definitions", count);
+
+}
+
+/**
+ * @brief Get localized help text for a command
+ * @param commandId Command identifier from database
+ * @return Pointer to locale data, or NULL if not found
+ *
+ * Looks up the CommandHelpLocale for a given command ID.
+ * The returned structure contains a vector of help strings
+ * indexed by locale index.
+ *
+ * @return NULL if command has no localization data
+ * @return Valid pointer to CommandHelpLocale with HelpText vector
+ */
+CommandHelpLocale const* CommandMgr::GetCommandLocale(uint32 commandId) const
+{
+    CommandHelpLocaleMap::const_iterator itr = m_CommandHelpLocaleMap.find(commandId);
+    if (itr == m_CommandHelpLocaleMap.end())
+    {
+        return NULL;
+    }
+    return &itr->second;
+}
+
+/**
+ * @brief Get localized help text string for a command
+ * @param commandId Command identifier from database
+ * @param loc_idx Locale index (0-based)
+ * @param namePtr Pointer to store the help text string
+ *
+ * Retrieves the localized help text string for a given command ID
+ * and locale index. If the command has no localization data or
+ * the locale index is out of range, the function will not modify
+ * the output string.
+ *
+ * @note The output string is only modified if the command has
+ *       localization data and the locale index is valid.
+ */
+void CommandMgr::GetCommandHelpLocaleString(uint32 commandId, int32 loc_idx, std::string* namePtr) const
+{
+    if (loc_idx >= 0)
+    {
+        if (CommandHelpLocale const* il = GetCommandLocale(commandId))
+        {
+            if (namePtr && il->HelpText.size() > size_t(loc_idx) && !il->HelpText[loc_idx].empty())
+            {
+                *namePtr = il->HelpText[loc_idx];
+            }
+        }
+    }
+}

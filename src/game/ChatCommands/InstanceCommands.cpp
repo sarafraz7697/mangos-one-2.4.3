@@ -1,0 +1,224 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * MaNGOS is a full featured server for World of Warcraft, supporting
+ * the following clients: 1.12.x, 2.4.3, 3.3.5a, 4.3.4a and 5.4.8
+ *
+ * Copyright (C) 2005-2026 MaNGOS <https://www.getmangos.eu>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * World of Warcraft, and all World of Warcraft or Warcraft art, images,
+ * and lore are copyrighted by Blizzard Entertainment, Inc.
+ */
+
+/**
+ * @file InstanceCommands.cpp
+ * @brief Implementation of instance and dungeon management chat commands.
+ *
+ * This file contains chat command handlers for instance operations including:
+ * - Instance bindings management
+ * - Instance reset operations
+ * - Instance difficulty configuration
+ * - Instance data manipulation
+ */
+
+#include "Chat.h"
+#include "ObjectMgr.h"
+#include "MapManager.h"
+#include "InstanceData.h"
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <string>
+
+/**
+ * @brief Handler for HandleInstanceListBindsCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleInstanceListBindsCommand(char* /*args*/)
+{
+    Player* player = getSelectedPlayer();
+    if (!player)
+    {
+        player = m_session->GetPlayer();
+    }
+    uint32 counter = 0;
+    for (uint8 i = 0; i < MAX_DIFFICULTY; ++i)
+    {
+        Player::BoundInstancesMap& binds = player->GetBoundInstances(Difficulty(i));
+        for (Player::BoundInstancesMap::const_iterator itr = binds.begin(); itr != binds.end(); ++itr)
+        {
+            DungeonPersistentState* state = itr->second.state;
+            std::string timeleft = secsToTimeString(state->GetResetTime() - time(NULL), TimeFormat::ShortText);
+            if (const MapEntry* entry = sMapStore.LookupEntry(itr->first))
+            {
+                PSendSysMessage("map: %d (%s) inst: %d perm: %s diff: %s canReset: %s TTR: %s",
+                                itr->first, entry->MapName_lang[GetSessionDbcLocale()], state->GetInstanceId(), itr->second.perm ? "yes" : "no",
+                                state->GetDifficulty() == DUNGEON_DIFFICULTY_NORMAL ? "normal" : "heroic", state->CanReset() ? "yes" : "no", timeleft.c_str());
+            }
+            else
+            {
+                PSendSysMessage("bound for a nonexistent map %u", itr->first);
+            }
+            ++counter;
+        }
+    }
+    PSendSysMessage("player binds: %d", counter);
+    counter = 0;
+
+    if (Group* group = player->GetGroup())
+    {
+        for (uint8 i = 0; i < MAX_DIFFICULTY; ++i)
+        {
+            Group::BoundInstancesMap& binds = group->GetBoundInstances(Difficulty(i));
+            for (Group::BoundInstancesMap::const_iterator itr = binds.begin(); itr != binds.end(); ++itr)
+            {
+                DungeonPersistentState* state = itr->second.state;
+                std::string timeleft = secsToTimeString(state->GetResetTime() - time(NULL), TimeFormat::ShortText);
+                if (const MapEntry* entry = sMapStore.LookupEntry(itr->first))
+                {
+                    PSendSysMessage("map: %d (%s) inst: %d perm: %s diff: %s canReset: %s TTR: %s",
+                                    itr->first, entry->MapName_lang[GetSessionDbcLocale()], state->GetInstanceId(), itr->second.perm ? "yes" : "no",
+                                    state->GetDifficulty() == DUNGEON_DIFFICULTY_NORMAL ? "normal" : "heroic", state->CanReset() ? "yes" : "no", timeleft.c_str());
+                }
+                else
+                {
+                    PSendSysMessage("bound for a nonexistent map %u", itr->first);
+                }
+                counter++;
+            }
+        }
+    }
+    PSendSysMessage("group binds: %d", counter);
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleInstanceUnbindCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleInstanceUnbindCommand(char* args)
+{
+    if (!*args)
+    {
+        return false;
+    }
+
+    Player* player = getSelectedPlayer();
+    if (!player)
+    {
+        player = m_session->GetPlayer();
+    }
+    uint32 counter = 0;
+    uint32 mapid = 0;
+    bool got_map = false;
+
+    if (strncmp(args, "all", strlen(args)) != 0)
+    {
+        if (!isNumeric(args[0]))
+        {
+            return false;
+        }
+
+        got_map = true;
+        mapid = atoi(args);
+    }
+
+    for (uint8 i = 0; i < MAX_DIFFICULTY; ++i)
+    {
+        Player::BoundInstancesMap& binds = player->GetBoundInstances(Difficulty(i));
+        for (Player::BoundInstancesMap::iterator itr = binds.begin(); itr != binds.end();)
+        {
+            if (got_map && mapid != itr->first)
+            {
+                ++itr;
+                continue;
+            }
+            if (itr->first != player->GetMapId())
+            {
+                DungeonPersistentState* save = itr->second.state;
+                std::string timeleft = secsToTimeString(save->GetResetTime() - time(NULL), TimeFormat::ShortText);
+
+                if (const MapEntry* entry = sMapStore.LookupEntry(itr->first))
+                {
+                    PSendSysMessage("unbinding map: %d (%s) inst: %d perm: %s diff: %s canReset: %s TTR: %s",
+                                    itr->first, entry->MapName_lang[GetSessionDbcLocale()], save->GetInstanceId(), itr->second.perm ? "yes" : "no",
+                                    save->GetDifficulty() == DUNGEON_DIFFICULTY_NORMAL ? "normal" : "heroic", save->CanReset() ? "yes" : "no", timeleft.c_str());
+                }
+                else
+                {
+                    PSendSysMessage("bound for a nonexistent map %u", itr->first);
+                }
+                player->UnbindInstance(itr, Difficulty(i));
+                ++counter;
+            }
+            else
+            {
+                ++itr;
+            }
+        }
+    }
+    PSendSysMessage("instances unbound: %d", counter);
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleInstanceStatsCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleInstanceStatsCommand(char* /*args*/)
+{
+    PSendSysMessage("instances loaded: %d", sMapMgr.GetNumInstances());
+    PSendSysMessage("players in instances: %d", sMapMgr.GetNumPlayersInInstances());
+
+    uint32 numSaves, numBoundPlayers, numBoundGroups;
+    sMapPersistentStateMgr.GetStatistics(numSaves, numBoundPlayers, numBoundGroups);
+    PSendSysMessage("instance saves: %d", numSaves);
+    PSendSysMessage("players bound: %d", numBoundPlayers);
+    PSendSysMessage("groups bound: %d", numBoundGroups);
+    return true;
+}
+
+/**
+ * @brief Handler for HandleInstanceSaveDataCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleInstanceSaveDataCommand(char* /*args*/)
+{
+    Player* pl = m_session->GetPlayer();
+
+    Map* map = pl->GetMap();
+
+    InstanceData* iData = map->GetInstanceData();
+    if (!iData)
+    {
+        PSendSysMessage("Map has no instance data.");
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    iData->SaveToDB();
+    return true;
+}

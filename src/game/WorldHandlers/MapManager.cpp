@@ -1,0 +1,675 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * MaNGOS is a full featured server for World of Warcraft, supporting
+ * the following clients: 1.12.x, 2.4.3, 3.3.5a, 4.3.4a and 5.4.8
+ *
+ * Copyright (C) 2005-2026 MaNGOS <https://www.getmangos.eu>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * World of Warcraft, and all World of Warcraft or Warcraft art, images,
+ * and lore are copyrighted by Blizzard Entertainment, Inc.
+ */
+
+/**
+ * @file MapManager.cpp
+ * @brief Map manager implementation
+ *
+ * This file implements MapManager, a singleton that manages all map
+ * instances on the server. Key responsibilities:
+ *
+ * - Map instance creation and destruction
+ * - Map lookup by ID and instance ID
+ * - Continent map management (shared instances)
+ * - Instance map management (separate instances)
+ * - Player-to-map routing
+ * - Map update scheduling
+ * - Transport system management
+ *
+ * MapManager ensures proper cleanup of unused maps and efficient
+ * routing of players to their current map instance.
+ *
+ * @see MapManager for the manager class
+ * @see Map for individual map implementation
+ */
+
+#include "Utilities/Errors.h"
+#include "MapManager.h"
+#include "MapPersistentStateMgr.h"
+#include "Policies/Singleton.h"
+#include "Database/DatabaseEnv.h"
+#include "Log.h"
+#include "Transports.h"
+#include "TransportMap.h"
+#include "GridDefines.h"
+#include "World.h"
+#include "CellImpl.h"
+#include "ObjectMgr.h"
+#include "SimulationTime.h"
+
+#ifdef ENABLE_ELUNA
+#include "ElunaConfig.h"
+#include <cassert>
+#include <cstdlib>
+#include <functional>
+#include <mutex>
+#endif /* ENABLE_ELUNA */
+
+
+MapManager::MapManager()
+    : i_gridCleanUpDelay(sWorld.getConfig(CONFIG_UINT32_INTERVAL_GRIDCLEAN)), m_lock()
+{
+    i_timer.SetInterval(sWorld.getConfig(CONFIG_UINT32_INTERVAL_MAPUPDATE));
+}
+
+MapManager::~MapManager()
+{
+    // Vessels BEFORE maps -- see the comment in UnloadAll(). Ordinarily UnloadAll has already
+    // done this and the set is empty; this is the path where it never ran.
+    DestroyTransports();
+
+    for (MapMapType::iterator iter = i_maps.begin(); iter != i_maps.end(); ++iter)
+    {
+        delete iter->second;
+    }
+
+    DeleteStateMachine();
+}
+
+/**
+ * @brief Destroy every vessel, and with it every crew member aboard.
+ *
+ * This MUST run while the maps are still alive. A transport owns its crew outright (nothing
+ * else does -- they are in no grid cell, so no Map::UnloadAll will ever reach them), and
+ * ~Transport tears each one down through Creature::RemoveFromWorld, which reaches into the
+ * map's object store to unregister it. Delete the maps first and that store is freed memory.
+ *
+ * Idempotent: the set is emptied, so the destructor calling this again is a no-op.
+ */
+void MapManager::DestroyTransports()
+{
+    // Crew live in their map's object store, not the vessel's, and the vessel itself is in
+    // the world without being in any cell. Both have to be undone while the maps are still
+    // alive -- the vessels are deleted below, after them.
+    for (TransportSet::iterator i = m_Transports.begin(); i != m_Transports.end(); ++i)
+    {
+        (*i)->WithdrawFromWorld();
+    }
+
+    for (TransportSet::iterator i = m_Transports.begin(); i != m_Transports.end(); ++i)
+    {
+        delete *i;
+    }
+
+    m_Transports.clear();
+    m_TransportsByMap.clear();
+}
+
+void
+MapManager::Initialize()
+{
+    int num_threads(sWorld.getConfig(CONFIG_UINT32_NUMTHREADS));
+
+#ifdef ENABLE_ELUNA
+    if (sElunaConfig->IsElunaEnabled() && sElunaConfig->IsElunaCompatibilityMode() && num_threads > 1)
+    {
+        // Force 1 thread for Eluna if compatibility mode is enabled. Compatibility mode is single state and does not allow more update threads.
+        sLog.outError("Map update threads set to %i, when Eluna in compatibility mode only allows 1, changing to 1", num_threads);
+        num_threads = 1;
+    }
+#endif /* ENABLE_ELUNA */
+
+    // Start mtmaps if needed.
+    if (num_threads > 0 && m_updater.activate(num_threads) == -1)
+    {
+        abort();
+    }
+
+    InitStateMachine();
+    InitMaxInstanceId();
+}
+
+/**
+ * @brief Creates the grid state machine instances used by map updates.
+ */
+void MapManager::InitStateMachine()
+{
+    si_GridStates[GRID_STATE_INVALID] = new InvalidState;
+    si_GridStates[GRID_STATE_ACTIVE] = new ActiveState;
+    si_GridStates[GRID_STATE_IDLE] = new IdleState;
+    si_GridStates[GRID_STATE_REMOVAL] = new RemovalState;
+}
+
+/**
+ * @brief Destroys the grid state machine instances.
+ */
+void MapManager::DeleteStateMachine()
+{
+    delete si_GridStates[GRID_STATE_INVALID];
+    delete si_GridStates[GRID_STATE_ACTIVE];
+    delete si_GridStates[GRID_STATE_IDLE];
+    delete si_GridStates[GRID_STATE_REMOVAL];
+}
+
+/**
+ * @brief Updates a single grid through its current state handler.
+ *
+ * @param state The current grid state.
+ * @param map The owning map.
+ * @param ngrid The grid being updated.
+ * @param ginfo The grid info structure.
+ * @param x The grid X coordinate.
+ * @param y The grid Y coordinate.
+ * @param t_diff The elapsed update time.
+ */
+void MapManager::UpdateGridState(grid_state_t state, Map& map, NGridType& ngrid, GridInfo& ginfo, const uint32& x, const uint32& y, const uint32& t_diff)
+{
+    // TODO: The grid state array itself is static and therefore 100% safe, however, the data
+    // the state classes in it accesses is not, since grids are shared across maps (for example
+    // in instances), so some sort of locking will be necessary later.
+
+    si_GridStates[state]->Update(map, ngrid, ginfo, x, y, t_diff);
+}
+
+/**
+ * @brief Reinitializes visibility distance settings for all loaded maps.
+ */
+void MapManager::InitializeVisibilityDistanceInfo()
+{
+    for (MapMapType::iterator iter = i_maps.begin(); iter != i_maps.end(); ++iter)
+    {
+        (*iter).second->InitVisibilityDistance();
+    }
+}
+
+/// @param id - MapId of the to be created map. @param obj WorldObject for which the map is to be created. Must be player for Instancable maps.
+Map* MapManager::CreateMap(uint32 id, const WorldObject* obj)
+{
+    std::lock_guard<LOCK_TYPE> _guard(m_lock);
+
+    Map* m = NULL;
+
+    const MapEntry* entry = sMapStore.LookupEntry(id);
+    if (!entry)
+    {
+        return NULL;
+    }
+
+    if (entry->Instanceable())
+    {
+        MANGOS_ASSERT(obj && obj->GetTypeId() == TYPEID_PLAYER);
+        // create DungeonMap object
+        m = CreateInstance(id, (Player*)obj);
+        // Load active objects for this map
+        sObjectMgr.LoadActiveEntities(m);
+    }
+    else
+    {
+        // create regular non-instanceable map
+        m = FindMap_unlocked(id);   // m_lock is already held
+        if (m == NULL)
+        {
+            // A vessel's deck is its own kind of map, and the vessel asking for it is the
+            // object it belongs to -- which is the only moment that link can be made.
+            if (Transport::IsVesselMapId(id) && obj &&
+                obj->GetTypeId() == TYPEID_GAMEOBJECT)
+            {
+                m = new TransportMap(id, i_gridCleanUpDelay,
+                                     const_cast<Transport*>(static_cast<Transport const*>(obj)));
+            }
+            else
+            {
+                m = new WorldMap(id, i_gridCleanUpDelay);
+            }
+            // add map into container
+            i_maps[MapID(id)] = m;
+
+            // non-instanceable maps always expected have saved state
+            m->CreateInstanceData(true);
+        }
+    }
+
+    return m;
+}
+
+/**
+ * @brief Creates a battleground map instance.
+ *
+ * @param mapid The battleground map id.
+ * @param bg The battleground owning the map.
+ * @return Map* The created battleground map.
+ */
+Map* MapManager::CreateBgMap(uint32 mapid, BattleGround* bg)
+{
+    sTerrainMgr.LoadTerrain(mapid);
+
+    std::lock_guard<LOCK_TYPE> _guard(m_lock);
+    return CreateBattleGroundMap(mapid, sMapMgr.GenerateInstanceId(), bg);
+}
+
+/**
+ * @brief Finds a loaded map by map id and instance id.
+ *
+ * @param mapid The map id.
+ * @param instanceId The instance id.
+ * @return Map* The loaded map, or null if not found.
+ */
+Map* MapManager::FindMap(uint32 mapid, uint32 instanceId) const
+{
+    std::lock_guard<LOCK_TYPE> _guard(m_lock);
+    return FindMap_unlocked(mapid, instanceId);
+}
+
+/// Body of FindMap(), for callers that already hold m_lock. See the header.
+Map* MapManager::FindMap_unlocked(uint32 mapid, uint32 instanceId) const
+{
+    MapMapType::const_iterator iter = i_maps.find(MapID(mapid, instanceId));
+    if (iter == i_maps.end())
+    {
+        return NULL;
+    }
+
+    // this is a small workaround for transports
+    if (instanceId == 0 && iter->second->Instanceable())
+    {
+        assert(false);
+        return NULL;
+    }
+
+    return iter->second;
+}
+
+/**
+ * @brief Deletes a loaded instance map.
+ *
+ * @param mapid The map id.
+ * @param instanceId The instance id.
+ */
+void MapManager::DeleteInstance(uint32 mapid, uint32 instanceId)
+{
+    std::lock_guard<LOCK_TYPE> _guard(m_lock);
+
+    MapMapType::iterator iter = i_maps.find(MapID(mapid, instanceId));
+    if (iter != i_maps.end())
+    {
+        Map* pMap = iter->second;
+        if (pMap->Instanceable())
+        {
+            i_maps.erase(iter);
+
+            pMap->UnloadAll(true);
+            delete pMap;
+        }
+    }
+}
+
+/**
+ * @brief Updates all loaded maps and transports.
+ *
+ * @param diff The elapsed update time.
+ */
+void MapManager::Update(uint32 diff)
+{
+    i_timer.Update(diff);
+    if (!i_timer.Passed())
+    {
+        return;
+    }
+
+    // Whole beats only, because i_timer.Reset() below KEEPS the remainder. Handing out
+    // GetCurrent() would ship those milliseconds now and count them again next cycle, so
+    // every spline, aura tick and AI timer on every map runs fast by half an interval per
+    // tick -- ~10% at a 50ms beat, which is a taxi flight ending half a minute early.
+    const uint32 elapsed = uint32(i_timer.GetCurrent() - i_timer.GetCurrent() % i_timer.GetInterval());
+
+    // The simulation clock moves HERE and nowhere else, by the number the maps are about to
+    // be handed, before any of them runs. That is what makes an object's elapsed time and
+    // its map's tick two readings of one quantity: there is no second source to drift from.
+    Simulation::Advance(elapsed);
+
+    // The world's maps, in parallel, each owning its own grid. A vessel's deck is NOT
+    // among them: it belongs to the vessel, which runs it nested inside the tick of the
+    // map it sails, once that map has finished with its own containers. There is no second
+    // pass and no barrier between them, because there are no longer two of anything.
+    for (MapMapType::iterator iter=i_maps.begin(); iter != i_maps.end(); ++iter)
+    {
+        if (iter->second->AsTransport())
+        {
+            continue;
+        }
+
+        if (m_updater.activated())
+        {
+            m_updater.schedule_update(*iter->second, elapsed);
+        }
+        else
+        {
+            iter->second->Update(elapsed);
+        }
+    }
+
+    if (m_updater.activated())
+    {
+        m_updater.wait();
+    }
+
+    // PAST THE BARRIER, WHERE NO MAP IS RUNNING. A vessel that reached the end of one world
+    // map decided so on that map's thread, and could go no further there: arriving writes
+    // into the destination's active list, object store and player list, and the destination
+    // may have been updating on another core at that very moment. Here nothing is.
+    for (TransportSet::iterator i = m_Transports.begin(); i != m_Transports.end(); ++i)
+    {
+        if ((*i)->IsCrossing())
+        {
+            (*i)->CompleteCrossing();
+        }
+    }
+
+    // remove all maps which can be unloaded
+    MapMapType::iterator iter = i_maps.begin();
+    while (iter != i_maps.end())
+    {
+        Map* pMap = iter->second;
+
+        // A deck outlives every voyage: it is loaded once and never unloaded, because no
+        // player ever "enters" it to keep it awake and its crew have nowhere else to be.
+        if (pMap->AsTransport())
+        {
+            ++iter;
+            continue;
+        }
+
+        // check if map can be unloaded
+        if (pMap->CanUnload(elapsed))
+        {
+            pMap->UnloadAll(true);
+            delete pMap;
+
+            i_maps.erase(iter++);
+        }
+        else
+        {
+            ++iter;
+        }
+    }
+
+    // Reset(), not SetCurrent(0): Reset keeps the remainder (`_current %= _interval`) so the
+    // beat stays phase-locked to the interval. Dropping it re-quantised every cycle to the
+    // caller's own tick, which is where the alternating 100/101ms grid in the trace came from.
+    // Only valid because `elapsed` above withheld exactly that remainder -- the two together
+    // conserve time. Hand out GetCurrent() here and the carry is spent twice.
+    i_timer.Reset();
+}
+
+/**
+ * @brief Removes all objects pending deletion from all loaded maps.
+ */
+void MapManager::RemoveAllObjectsInRemoveList()
+{
+    for (MapMapType::iterator iter = i_maps.begin(); iter != i_maps.end(); ++iter)
+    {
+        iter->second->RemoveAllObjectsInRemoveList();
+    }
+}
+
+/**
+ * @brief Checks whether map and vmap data exist for a location.
+ *
+ * @param mapid The map id.
+ * @param x The X coordinate.
+ * @param y The Y coordinate.
+ * @return true if both map and vmap data exist; otherwise false.
+ */
+bool MapManager::ExistMapAndVMap(uint32 mapid, float x, float y)
+{
+    GridPair p = MaNGOS::ComputeGridPair(x, y);
+
+    int gx = 63 - p.x_coord;
+    int gy = 63 - p.y_coord;
+
+    // Terrain + collision are one fused tile now, so a single existence check.
+    return TerrainInfo::ExistTile(mapid, gx, gy);
+}
+
+/**
+ * @brief Checks whether a map id is valid for loading.
+ *
+ * @param mapid The map id.
+ * @return true if the map is valid; otherwise false.
+ */
+bool MapManager::IsValidMAP(uint32 mapid)
+{
+    MapEntry const* mEntry = sMapStore.LookupEntry(mapid);
+    return mEntry && (!mEntry->IsDungeon() || ObjectMgr::GetInstanceTemplate(mapid));
+    // TODO: add check for battleground template
+}
+
+/**
+ * @brief Unloads all maps and terrain data.
+ */
+void MapManager::UnloadAll()
+{
+    // The vessels first, while their maps are still standing: a crew member is registered in
+    // its map's object store and unregisters itself from there as it is destroyed. Nothing
+    // else will ever free them -- a transport is in no grid cell, so Map::UnloadAll cannot
+    // see it, and its crew are in no cell either.
+    DestroyTransports();
+
+    for (MapMapType::iterator iter = i_maps.begin(); iter != i_maps.end(); ++iter)
+    {
+        iter->second->UnloadAll(true);
+    }
+
+    while (!i_maps.empty())
+    {
+        delete i_maps.begin()->second;
+        i_maps.erase(i_maps.begin());
+    }
+
+    TerrainManager::Instance().UnloadAll();
+
+    if (m_updater.activated())
+    {
+        sLog.outString("[shutdown] MapManager::UnloadAll: deactivating MapUpdater...");
+        m_updater.deactivate();
+        sLog.outString("[shutdown] MapManager::UnloadAll: MapUpdater deactivated");
+    }
+}
+
+/**
+ * @brief Initializes the highest known instance id from the database.
+ */
+void MapManager::InitMaxInstanceId()
+{
+    i_MaxInstanceId = 0;
+
+    QueryResult* result = CharacterDatabase.Query("SELECT MAX(`id`) FROM `instance`");
+    if (result)
+    {
+        i_MaxInstanceId = result->Fetch()[0].GetUInt32();
+        delete result;
+    }
+}
+
+/**
+ * @brief Counts loaded dungeon instances.
+ *
+ * @return uint32 The number of loaded dungeon maps.
+ */
+uint32 MapManager::GetNumInstances()
+{
+    uint32 ret = 0;
+
+    std::lock_guard<LOCK_TYPE> _guard(m_lock);
+    for (MapMapType::iterator itr = i_maps.begin(); itr != i_maps.end(); ++itr)
+    {
+        Map* map = itr->second;
+        if (!map->IsDungeon())
+        {
+            continue;
+        }
+        ret += 1;
+    }
+    return ret;
+}
+
+/**
+ * @brief Counts players currently inside loaded dungeon instances.
+ *
+ * @return uint32 The number of players in loaded instances.
+ */
+uint32 MapManager::GetNumPlayersInInstances()
+{
+    uint32 ret = 0;
+
+    std::lock_guard<LOCK_TYPE> _guard(m_lock);
+    for (MapMapType::iterator itr = i_maps.begin(); itr != i_maps.end(); ++itr)
+    {
+        Map* map = itr->second;
+        if (!map->IsDungeon())
+        {
+            continue;
+        }
+        ret += map->GetPlayers().getSize();
+    }
+    return ret;
+}
+
+///// returns a new or existing Instance
+///// in case of battlegrounds it will only return an existing map, those maps are created by bg-system
+Map* MapManager::CreateInstance(uint32 id, Player* player)
+{
+    Map* map = NULL;
+    Map* pNewMap = NULL;
+    uint32 NewInstanceId = 0;                               // instanceId of the resulting map
+    const MapEntry* entry = sMapStore.LookupEntry(id);
+
+    if (entry->IsBattleGroundOrArena())
+    {
+        // find existing bg map for player
+        NewInstanceId = player->GetBattleGroundId();
+        MANGOS_ASSERT(NewInstanceId);
+        map = FindMap_unlocked(id, NewInstanceId);   // called under m_lock from CreateMap()
+        MANGOS_ASSERT(map);
+    }
+    else if (DungeonPersistentState* pSave = player->GetBoundInstanceSaveForSelfOrGroup(id))
+    {
+        // solo/perm/group
+        NewInstanceId = pSave->GetInstanceId();
+        map = FindMap_unlocked(id, NewInstanceId);   // called under m_lock from CreateMap()
+        // it is possible that the save exists but the map doesn't
+        if (!map)
+        {
+            pNewMap = CreateDungeonMap(id, NewInstanceId, pSave->GetDifficulty(), pSave);
+        }
+    }
+    else
+    {
+        // if no instanceId via group members or instance saves is found
+        // the instance will be created for the first time
+        NewInstanceId = GenerateInstanceId();
+
+        Difficulty diff = player->GetGroup() ? player->GetGroup()->GetDifficulty() : player->GetDifficulty();
+        pNewMap = CreateDungeonMap(id, NewInstanceId, diff);
+    }
+
+    // add a new map object into the registry
+    if (pNewMap)
+    {
+        i_maps[MapID(id, NewInstanceId)] = pNewMap;
+        map = pNewMap;
+    }
+
+    return map;
+}
+
+/**
+ * @brief Creates a dungeon map instance.
+ *
+ * @param id The map id.
+ * @param InstanceId The instance id.
+ * @param save The optional persistent state to load from.
+ * @return DungeonMap* The created dungeon map.
+ */
+DungeonMap* MapManager::CreateDungeonMap(uint32 id, uint32 InstanceId, Difficulty difficulty, DungeonPersistentState* save)
+{
+    // make sure we have a valid map id
+    const MapEntry* entry = sMapStore.LookupEntry(id);
+    if (!entry)
+    {
+        sLog.outError("CreateDungeonMap: no entry for map %d", id);
+        MANGOS_ASSERT(false);
+    }
+    if (!ObjectMgr::GetInstanceTemplate(id))
+    {
+        sLog.outError("CreateDungeonMap: no instance template for map %d", id);
+        MANGOS_ASSERT(false);
+    }
+
+    // some instances only have one difficulty
+    if (entry && !entry->SupportsHeroicMode())
+    {
+        difficulty = DUNGEON_DIFFICULTY_NORMAL;
+    }
+
+    DEBUG_LOG("MapInstanced::CreateDungeonMap: %s map instance %d for %d created with difficulty %d", save ? "" : "new ", InstanceId, id, difficulty);
+
+    DungeonMap* map = new DungeonMap(id, i_gridCleanUpDelay, InstanceId, difficulty);
+
+    // Dungeons can have saved instance data
+    bool load_data = save != NULL;
+    map->CreateInstanceData(load_data);
+
+    return map;
+}
+
+/**
+ * @brief Creates a battleground map instance and binds it to a battleground.
+ *
+ * @param id The map id.
+ * @param InstanceId The instance id.
+ * @param bg The battleground owning the map.
+ * @return BattleGroundMap* The created battleground map.
+ */
+BattleGroundMap* MapManager::CreateBattleGroundMap(uint32 id, uint32 InstanceId, BattleGround* bg)
+{
+    DEBUG_LOG("MapInstanced::CreateBattleGroundMap: instance:%d for map:%d and bgType:%d created.", InstanceId, id, bg->GetTypeID());
+
+    BattleGroundMap* map = new BattleGroundMap(id, i_gridCleanUpDelay, InstanceId);
+    MANGOS_ASSERT(map->IsBattleGroundOrArena());
+    map->SetBG(bg);
+    bg->SetBgMap(map);
+
+    // add map into map container
+    i_maps[MapID(id, InstanceId)] = map;
+
+    // BGs/Arenas not have saved instance data
+    map->CreateInstanceData(false);
+
+    return map;
+}
+
+/**
+ * @brief Executes a worker for every loaded map.
+ *
+ * @param worker The callback to run for each map.
+ */
+void MapManager::DoForAllMaps(const std::function<void(Map*)>& worker)
+{
+    for (MapMapType::const_iterator itr = i_maps.begin(); itr != i_maps.end(); ++itr)
+    {
+        worker(itr->second);
+    }
+}

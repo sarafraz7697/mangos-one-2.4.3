@@ -1,0 +1,243 @@
+#pragma once
+
+#include "terrain/Geometry.hpp"
+#include "terrain/ICollisionModel.hpp"
+
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <vector>
+
+namespace world::terrain
+{
+    constexpr float TILE_SIZE = 533.33333f;
+    constexpr int GRID_PER_TILE = 128;
+    constexpr int V9_SIDE = GRID_PER_TILE + 1;
+    constexpr int CHUNKS = 16;
+    constexpr int CELLS_PER_CHUNK = GRID_PER_TILE / CHUNKS;
+    constexpr uint32_t MAP_CENTER = 32;
+
+    constexpr int FusedTerrainGridCount = 64;
+
+    /// What a segment query answers with when nothing was hit. Any value past 1.0 says
+    /// "beyond the far end"; naming it keeps every producer and every test on one word.
+    constexpr float NO_HIT_FRACTION = 2.0f;
+
+    inline float GridCoord(float c) { return GRID_PER_TILE * (MAP_CENTER - c / TILE_SIZE); }
+
+    /// TWO defects, at opposite ends of the same axis. Both fixes are required; each
+    /// was found independently, and either one alone still answers wrongly at the end
+    /// it does not cover.
+    ///
+    /// FLOOR, not truncate. The shift already floors for a negative grid coordinate,
+    /// but the conversion to int in front of it truncates toward zero: a grid
+    /// coordinate in (-1, 0) -- the 4.16-yard strip at the far corner of the map --
+    /// became 0 >> 7 = tile 0 instead of tile -1, so a point off one edge was answered
+    /// with the tile off the opposite one.
+    ///
+    /// The grid is half-open everywhere except its far edge, which is a real coordinate:
+    /// c = -32 * TILE_SIZE lands exactly on 8192 and shifts to 64, one past the last
+    /// tile, so the extreme corner of a 64x64 map answered "no tile" instead of the tile
+    /// it is the corner of. Only that exact boundary folds -- anything further out stays
+    /// out of range, because a query off the map must not be served the edge tile.
+    ///
+    /// The two compose: flooring leaves an exact 8192 exactly 8192, so the boundary
+    /// still folds, and the fold's guard is false for every negative index, so the
+    /// floored value still shifts.
+    inline int TileIndex(float c)
+    {
+        const int g = static_cast<int>(std::floor(GridCoord(c)));
+        return g == GRID_PER_TILE * FusedTerrainGridCount ? FusedTerrainGridCount - 1
+                                                          : (g >> 7);
+    }
+
+    enum class LiquidKind : uint8_t
+    {
+        None = 0,
+        Water = 1,
+        Ocean = 2,
+        Magma = 3,
+        Slime = 4,
+    };
+
+    struct LiquidInfo
+    {
+        float level = 0.f;
+        LiquidKind kind = LiquidKind::None;
+        uint16_t entry = 0;   ///< LiquidType.dbc row id (0 = unknown)
+        bool deep = false;    ///< drives swim fatigue ("dark water")
+    };
+
+    struct StaticInstance
+    {
+        Transform xf;
+        std::shared_ptr<const ICollisionModel> model;
+        Aabb worldBounds;
+        int32_t adtId = 0;
+    };
+
+    class TerrainTile
+    {
+    public:
+        int tx = 0, ty = 0;
+        bool hasTerrain = false;
+        bool isGlobalWmo = false;
+
+        std::vector<float> v9;                         ///< V9_SIDE*V9_SIDE corner heights
+        std::vector<float> v8;                         ///< GRID_PER_TILE^2 centre heights
+        std::array<uint16_t, CHUNKS * CHUNKS> holes{};
+        std::array<uint16_t, CHUNKS * CHUNKS> areaIds{};
+
+        bool hasLiquid = false;
+        std::vector<float> liquidHeight;    ///< V9_SIDE*V9_SIDE corner grid
+        std::vector<uint8_t> liquidShow;    ///< GRID_PER_TILE^2 cell mask
+        std::vector<uint8_t> liquidKind;    ///< GRID_PER_TILE^2 LiquidKind
+        std::vector<uint16_t> liquidEntry;  ///< GRID_PER_TILE^2 LiquidType.dbc id
+        std::vector<uint8_t> liquidDeep;    ///< GRID_PER_TILE^2 dark-water mask
+
+        std::vector<StaticInstance> instances;
+
+        // Mirrors the reference GridMap: four triangles meeting at the V8 centre.
+        std::optional<float> TerrainHeight(float x, float y) const
+        {
+            // SIZE, not emptiness. V9 is indexed at (ix + 1, iy + 1) with a stride of
+            // V9_SIDE, so a grid that is present but short reads off the end -- ReadTile
+            // enforces the shape, and this is the same check for a tile built in memory
+            // by a test or a tool that never went through it.
+            if (!hasTerrain || v9.size() != size_t(V9_SIDE) * V9_SIDE ||
+                v8.size() != size_t(GRID_PER_TILE) * GRID_PER_TILE)
+            {
+                return std::nullopt;
+            }
+
+            const float gx = GridCoord(x), gy = GridCoord(y);
+            const int ix = static_cast<int>(gx) & (GRID_PER_TILE - 1);
+            const int iy = static_cast<int>(gy) & (GRID_PER_TILE - 1);
+            if (IsHole(ix, iy))
+            {
+                return std::nullopt;
+            }
+
+            const float fx = gx - std::floor(gx);
+            const float fy = gy - std::floor(gy);
+
+            auto V9 = [&](int a, int b) { return v9[a * V9_SIDE + b]; };
+            auto V8 = [&](int a, int b) { return v8[a * GRID_PER_TILE + b]; };
+
+            float a, b, c;
+            if (fx + fy < 1.f)
+            {
+                if (fx > fy)
+                {
+                    const float h1 = V9(ix, iy), h2 = V9(ix + 1, iy), h5 = 2 * V8(ix, iy);
+                    a = h2 - h1;
+                    b = h5 - h1 - h2;
+                    c = h1;
+                }
+                else
+                {
+                    const float h1 = V9(ix, iy), h3 = V9(ix, iy + 1), h5 = 2 * V8(ix, iy);
+                    a = h5 - h1 - h3;
+                    b = h3 - h1;
+                    c = h1;
+                }
+            }
+            else
+            {
+                if (fx > fy)
+                {
+                    const float h2 = V9(ix + 1, iy), h4 = V9(ix + 1, iy + 1), h5 = 2 * V8(ix, iy);
+                    a = h2 + h4 - h5;
+                    b = h4 - h2;
+                    c = h5 - h4;
+                }
+                else
+                {
+                    const float h3 = V9(ix, iy + 1), h4 = V9(ix + 1, iy + 1), h5 = 2 * V8(ix, iy);
+                    a = h4 - h3;
+                    b = h3 + h4 - h5;
+                    c = h5 - h4;
+                }
+            }
+            return a * fx + b * fy + c;
+        }
+
+        std::optional<LiquidInfo> LiquidAt(float x, float y) const
+        {
+            if (!hasLiquid || liquidHeight.empty() || liquidShow.empty())
+            {
+                return std::nullopt;
+            }
+
+            const float gx = GridCoord(x), gy = GridCoord(y);
+            const int ix = static_cast<int>(gx) & (GRID_PER_TILE - 1);
+            const int iy = static_cast<int>(gy) & (GRID_PER_TILE - 1);
+            const int cell = ix * GRID_PER_TILE + iy;
+            if (!liquidShow[cell])
+            {
+                return std::nullopt;
+            }
+
+            const float fx = gx - std::floor(gx);
+            const float fy = gy - std::floor(gy);
+            auto LH = [&](int a, int b) { return liquidHeight[a * V9_SIDE + b]; };
+            const float top = LH(ix, iy) * (1 - fx) + LH(ix + 1, iy) * fx;
+            const float bot = LH(ix, iy + 1) * (1 - fx) + LH(ix + 1, iy + 1) * fx;
+
+            LiquidInfo info;
+            info.level = top * (1 - fy) + bot * fy;
+            info.kind = liquidKind.empty() ? LiquidKind::Water
+                                           : static_cast<LiquidKind>(liquidKind[cell]);
+            info.entry = liquidEntry.empty() ? uint16_t(0) : liquidEntry[cell];
+            info.deep = !liquidDeep.empty() && liquidDeep[cell] != 0;
+            return info;
+        }
+
+        bool IsHoleAt(int ix, int iy) const { return IsHole(ix, iy); }
+
+        uint16_t AreaId(float x, float y) const
+        {
+            const float gx = GridCoord(x), gy = GridCoord(y);
+            const int ix = static_cast<int>(gx) & (GRID_PER_TILE - 1);
+            const int iy = static_cast<int>(gy) & (GRID_PER_TILE - 1);
+            return areaIds[(ix / CELLS_PER_CHUNK) * CHUNKS + (iy / CELLS_PER_CHUNK)];
+        }
+
+    private:
+        // Each of the mask's 16 bits covers a 2x2 block of the chunk's 8x8 height cells.
+        bool IsHole(int ix, int iy) const
+        {
+            const int chunk = (ix / CELLS_PER_CHUNK) * CHUNKS + (iy / CELLS_PER_CHUNK);
+            const uint16_t mask = holes[chunk];
+            if (!mask)
+            {
+                return false;
+            }
+            const int hi = (ix % CELLS_PER_CHUNK) / 2, hj = (iy % CELLS_PER_CHUNK) / 2;
+            return (mask >> (hi * 4 + hj)) & 1u;
+        }
+    };
+
+    class ITileSource
+    {
+    public:
+        virtual ~ITileSource() = default;
+        virtual std::shared_ptr<TerrainTile> Load(uint32_t mapId, int tx, int ty) = 0;
+
+        /// The one tile that covers the whole map, for a map built from a single model
+        /// rather than an ADT grid. Nothing by default: most sources have a grid.
+        virtual std::shared_ptr<TerrainTile> LoadGlobal(uint32_t mapId)
+        {
+            (void)mapId;
+            return nullptr;
+        }
+    };
+
+    class NullTileSource : public ITileSource
+    {
+    public:
+        std::shared_ptr<TerrainTile> Load(uint32_t, int, int) override { return nullptr; }
+    };
+}

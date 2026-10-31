@@ -1,0 +1,237 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * MaNGOS is a full featured server for World of Warcraft, supporting
+ * the following clients: 1.12.x, 2.4.3, 3.3.5a, 4.3.4a and 5.4.8
+ *
+ * Copyright (C) 2005-2026 MaNGOS <https://www.getmangos.eu>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * World of Warcraft, and all World of Warcraft or Warcraft art, images,
+ * and lore are copyrighted by Blizzard Entertainment, Inc.
+ */
+
+
+
+#include "Player.h"
+#include "Language.h"
+#include "Database/DatabaseEnv.h"
+#include "Log.h"
+#include "Opcodes.h"
+#include "SpellMgr.h"
+#include "World.h"
+#include "WorldPacket.h"
+#include "WorldSession.h"
+#include "UpdateMask.h"
+#include "SkillDiscovery.h"
+#include "QuestDef.h"
+#include "GossipDef.h"
+#include "UpdateData.h"
+#include "Channel.h"
+#include "ChannelMgr.h"
+#include "MapManager.h"
+#include "MapPersistentStateMgr.h"
+#include "InstanceData.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
+#include "CellImpl.h"
+#include "ObjectMgr.h"
+#include "CreatureAI.h"
+#include "Formulas.h"
+#include "Group.h"
+#include "Guild.h"
+#include "GuildMgr.h"
+#include "Pet.h"
+#include "Util.h"
+#include "Transports.h"
+#include "Weather.h"
+#include "BattleGround/BattleGround.h"
+#include "BattleGround/BattleGroundMgr.h"
+#include "BattleGround/BattleGroundAV.h"
+#include "OutdoorPvP/OutdoorPvP.h"
+#include "ArenaTeam.h"
+#include "Chat.h"
+#include "Spell.h"
+#include "ScriptMgr.h"
+#include "SocialMgr.h"
+#include "Mail.h"
+#include "SpellAuras.h"
+#include "DBCStores.h"
+#include "SQLStorages.h"
+#include "DisableMgr.h"
+#ifdef ENABLE_ELUNA
+#include "LuaEngine.h"
+#endif /* ENABLE_ELUNA */
+
+/**
+ * @brief Forces or clears rooted movement for the player.
+ *
+ * @param enable True to root the player; false to unroot them.
+ */
+// Every setter below seeds m_movementInfo before it sends, as the Creature equivalents in
+// CreatureMovement.cpp already do: that struct is what WriteMovementInfo puts in create
+// blocks and heartbeats, and until now only the can-fly ACK ever repaired it.
+//
+// MOVEFLAG_ROOT is in movementFlagsMask, so this makes isMoving() true for a rooted player
+// -- but the client echoes ROOT in its own move packets, so that was already true one
+// round trip later. What changes is the size of the window, not the steady state.
+void Player::SetRoot(bool enable)
+{
+    if (enable)
+    {
+        m_movementInfo.AddMovementFlag(MOVEFLAG_ROOT);
+    }
+    else
+    {
+        m_movementInfo.RemoveMovementFlag(MOVEFLAG_ROOT);
+    }
+
+    WorldPacket data(enable ? SMSG_FORCE_MOVE_ROOT : SMSG_FORCE_MOVE_UNROOT, GetPackGUID().size() + 4);
+    data << GetPackGUID();
+    data << uint32(0);
+    SendMessageToSet(&data, true);
+}
+
+/**
+ * @brief Enables or disables water walking for the player.
+ *
+ * @param enable True to enable water walking; false to restore normal movement.
+ */
+void Player::SetWaterWalk(bool enable)
+{
+    if (enable)
+    {
+        m_movementInfo.AddMovementFlag(MOVEFLAG_WATERWALKING);
+    }
+    else
+    {
+        m_movementInfo.RemoveMovementFlag(MOVEFLAG_WATERWALKING);
+    }
+
+    // To the SET, like its four siblings here and like Creature::SetWaterWalk. This was the
+    // one force packet in the file addressed to the owning session alone, so the caster
+    // walked on the water and everybody else watched him swim through it.
+    WorldPacket data(enable ? SMSG_MOVE_WATER_WALK : SMSG_MOVE_LAND_WALK, GetPackGUID().size() + 4);
+    data << GetPackGUID();
+    data << uint32(0);
+    SendMessageToSet(&data, true);
+}
+
+/**
+ * @brief Placeholder for levitation support on this client version.
+ *
+ * @param enable Unused levitation state flag.
+ */
+void Player::SetLevitate(bool /*enable*/)
+{
+    // TODO: check if there is something similar for 2.4.3.
+    // WorldPacket data;
+    // if (enable)
+    //    data.Initialize(SMSG_MOVE_GRAVITY_DISABLE, 12);
+    // else
+    //    data.Initialize(SMSG_MOVE_GRAVITY_ENABLE, 12);
+    //
+    // data << GetPackGUID();
+    // data << uint32(0);                                      // unk
+    // SendMessageToSet(&data, true);
+
+    // data.Initialize(MSG_MOVE_GRAVITY_CHNG, 64);
+    // data << GetPackGUID();
+    // m_movementInfo.Write(data);
+    // SendMessageToSet(&data, false);
+}
+
+/**
+ * @brief Enables or disables flying movement flags for the player.
+ *
+ * @param enable True to enable flight-related movement flags; false to clear them.
+ */
+void Player::SetCanFly(bool enable)
+{
+    WorldPacket data;
+    if (enable)
+    {
+        m_movementInfo.AddMovementFlag(MOVEFLAG_CAN_FLY);
+        data.Initialize(SMSG_MOVE_SET_CAN_FLY, 12);
+    }
+    else
+    {
+        m_movementInfo.RemoveMovementFlag(MOVEFLAG_CAN_FLY);
+        data.Initialize(SMSG_MOVE_UNSET_CAN_FLY, 12);
+    }
+
+    data << GetPackGUID();
+    data << uint32(0);                                      // unk
+    SendMessageToSet(&data, true);
+
+    data.Initialize(MSG_MOVE_UPDATE_CAN_FLY, 64);
+    data << GetPackGUID();
+    m_movementInfo.Write(data);
+    SendMessageToSet(&data, false);
+}
+
+/**
+ * @brief Enables or disables feather fall movement for the player.
+ *
+ * @param enable True to enable feather fall; false to restore normal falling.
+ */
+void Player::SetFeatherFall(bool enable)
+{
+    WorldPacket data;
+    if (enable)
+    {
+        m_movementInfo.AddMovementFlag(MOVEFLAG_SAFE_FALL);
+        data.Initialize(SMSG_MOVE_FEATHER_FALL, 8 + 4);
+    }
+    else
+    {
+        m_movementInfo.RemoveMovementFlag(MOVEFLAG_SAFE_FALL);
+        data.Initialize(SMSG_MOVE_NORMAL_FALL, 8 + 4);
+    }
+
+    data << GetPackGUID();
+    data << uint32(0);
+    SendMessageToSet(&data, true);
+
+    // start fall from current height
+    if (!enable)
+    {
+        SetFallInformation(0, Where().Z());
+    }
+}
+
+/**
+ * @brief Enables or disables hover movement for the player.
+ *
+ * @param enable True to enable hovering; false to disable it.
+ */
+void Player::SetHover(bool enable)
+{
+    WorldPacket data;
+    if (enable)
+    {
+        m_movementInfo.AddMovementFlag(MOVEFLAG_HOVER);
+        data.Initialize(SMSG_MOVE_SET_HOVER, 8 + 4);
+    }
+    else
+    {
+        m_movementInfo.RemoveMovementFlag(MOVEFLAG_HOVER);
+        data.Initialize(SMSG_MOVE_UNSET_HOVER, 8 + 4);
+    }
+
+    data << GetPackGUID();
+    data << uint32(0);
+    SendMessageToSet(&data, true);
+}

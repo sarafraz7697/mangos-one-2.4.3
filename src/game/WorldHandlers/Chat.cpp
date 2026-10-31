@@ -1,0 +1,2158 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * MaNGOS is a full featured server for World of Warcraft, supporting
+ * the following clients: 1.12.x, 2.4.3, 3.3.5a, 4.3.4a and 5.4.8
+ *
+ * Copyright (C) 2005-2026 MaNGOS <https://www.getmangos.eu>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * World of Warcraft, and all World of Warcraft or Warcraft art, images,
+ * and lore are copyrighted by Blizzard Entertainment, Inc.
+ */
+
+/**
+ * @file Chat.cpp
+ * @brief Chat system implementation
+ *
+ * This file implements the chat system including:
+ * - Message formatting and color codes
+ * - Shift-link parsing (item, spell, quest links)
+ * - Channel message routing
+ * - Whisper, say, yell, emote handling
+ * - GM command parsing and execution
+ * - Language filtering
+ *
+ * The chat system supports various message types with different
+ * visibility ranges and formatting requirements.
+ *
+ * @see ChatHandler for command handling
+ * @see Channel for channel chat
+ */
+
+#include "Common/Locales.h"
+#include "Utilities/Errors.h"
+#include "Chat.h"
+#include "Language.h"
+#include "Database/DatabaseEnv.h"
+#include "WorldPacket.h"
+#include "WorldSession.h"
+#include "Opcodes.h"
+#include "Log.h"
+#include "World.h"
+#include "ObjectMgr.h"
+#include "ObjectGuid.h"
+#include "Player.h"
+#include "GridNotifiersImpl.h"
+#include "CellImpl.h"
+#include "AccountMgr.h"
+#include "SpellMgr.h"
+#include "PoolManager.h"
+#include "GameEventMgr.h"
+#include "AuctionHouseBot/AuctionHouseBot.h"
+#include "CommandMgr.h"
+#include "ObjectLookup.h"
+
+#ifdef ENABLE_ELUNA
+#include "LuaEngine.h"
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <sstream>
+#include <string>
+#endif /* ENABLE_ELUNA */
+
+// Supported shift-links (client generated and server side)
+// |color|Harea:area_id|h[name]|h|r
+// |color|Hareatrigger:id|h[name]|h|r
+// |color|Hareatrigger_target:id|h[name]|h|r
+// |color|Hcreature:creature_guid|h[name]|h|r
+// |color|Hcreature_entry:creature_id|h[name]|h|r
+// |color|Henchant:recipe_spell_id|h[prof_name: recipe_name]|h|r          - client, at shift click in recipes list dialog
+// |color|Hgameevent:id|h[name]|h|r
+// |color|Hgameobject:go_guid|h[name]|h|r
+// |color|Hgameobject_entry:go_id|h[name]|h|r
+// |color|Hitem:item_id:perm_ench_id:gem1:gem2:gem3:0:0:0:0|h[name]|h|r   - client, item icon shift click
+// |color|Hitemset:itemset_id|h[name]|h|r
+// |color|Hplayer:name|h[name]|h|r                                        - client, in some messages, at click copy only name instead link, so no way generate it in client string send to server
+// |color|Hpool:pool_id|h[name]|h|r
+// |color|Hquest:quest_id:quest_level|h[name]|h|r                         - client, quest list name shift-click
+// |color|Hskill:skill_id|h[name]|h|r
+// |color|Hspell:spell_id|h[name]|h|r                                     - client, spellbook spell icon shift-click
+// |color|Htalent:talent_id,rank|h[name]|h|r                              - client, talent icon shift-click rank==-1 if shift-copy unlearned talent
+// |color|Htaxinode:id|h[name]|h|r
+// |color|Htele:id|h[name]|h|r
+// |color|Htitle:id|h[name]|h|r
+
+bool ChatHandler::load_command_table = true;
+std::map<uint32, ObjectGuid> ChatHandler::m_consoleSelectedPlayers;
+
+/**
+ * @brief Builds and returns the root command table used by the chat handler.
+ *
+ * @return ChatCommand* The top-level command table.
+ */
+ChatCommand* ChatHandler::getCommandTable()
+{
+    static ChatCommand accountSetCommandTable[] =
+    {
+        { "addon",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAccountSetAddonCommand,     "", NULL },
+        { "gmlevel",        SEC_CONSOLE,        true,  &ChatHandler::HandleAccountSetGmLevelCommand,   "", NULL },
+        { "password",       SEC_CONSOLE,        true,  &ChatHandler::HandleAccountSetPasswordCommand,  "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand accountCommandTable[] =
+    {
+        { "characters",     SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAccountCharactersCommand,   "", NULL },
+        { "create",         SEC_CONSOLE,        true,  &ChatHandler::HandleAccountCreateCommand,       "", NULL },
+        { "delete",         SEC_CONSOLE,        true,  &ChatHandler::HandleAccountDeleteCommand,       "", NULL },
+        { "onlinelist",     SEC_CONSOLE,        true,  &ChatHandler::HandleAccountOnlineListCommand,   "", NULL },
+        { "lock",           SEC_PLAYER,         true,  &ChatHandler::HandleAccountLockCommand,         "", NULL },
+        { "set",            SEC_ADMINISTRATOR,  true,  NULL,                                           "", accountSetCommandTable },
+        { "password",       SEC_PLAYER,         true,  &ChatHandler::HandleAccountPasswordCommand,     "", NULL },
+        { "",               SEC_PLAYER,         true,  &ChatHandler::HandleAccountCommand,             "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand ahbotItemsAmountCommandTable[] =
+    {
+        { "grey",           SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotItemsAmountQualityCommand<AUCTION_QUALITY_GREY>,  "", NULL },
+        { "white",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotItemsAmountQualityCommand<AUCTION_QUALITY_WHITE>, "", NULL },
+        { "green",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotItemsAmountQualityCommand<AUCTION_QUALITY_GREEN>, "", NULL },
+        { "blue",           SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotItemsAmountQualityCommand<AUCTION_QUALITY_BLUE>,  "", NULL },
+        { "purple",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotItemsAmountQualityCommand<AUCTION_QUALITY_PURPLE>, "", NULL },
+        { "orange",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotItemsAmountQualityCommand<AUCTION_QUALITY_ORANGE>, "", NULL },
+        { "yellow",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotItemsAmountQualityCommand<AUCTION_QUALITY_YELLOW>, "", NULL },
+        { "",               SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotItemsAmountCommand,      "", NULL },
+        { NULL,             0,                  true,  NULL,                                             "", NULL }
+    };
+
+    static ChatCommand ahbotItemsRatioCommandTable[] =
+    {
+        { "alliance",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotItemsRatioHouseCommand<AUCTION_HOUSE_ALLIANCE>,  "", NULL },
+        { "horde",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotItemsRatioHouseCommand<AUCTION_HOUSE_HORDE>,     "", NULL },
+        { "neutral",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotItemsRatioHouseCommand<AUCTION_HOUSE_NEUTRAL>,   "", NULL },
+        { "",               SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotItemsRatioCommand,      "", NULL },
+        { NULL,             0,                  true,  NULL,                                             "", NULL }
+    };
+
+    static ChatCommand ahbotItemsCommandTable[] =
+    {
+        { "amount",         SEC_ADMINISTRATOR,  true,  NULL,                                           "", ahbotItemsAmountCommandTable},
+        { "ratio",          SEC_ADMINISTRATOR,  true,  NULL,                                           "", ahbotItemsRatioCommandTable},
+        { NULL,             0,                  true,  NULL,                                           "", NULL }
+    };
+
+    static ChatCommand ahbotCommandTable[] =
+    {
+        { "items",          SEC_ADMINISTRATOR,  true,  NULL,                                           "", ahbotItemsCommandTable},
+        { "rebuild",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotRebuildCommand,        "", NULL },
+        { "reload",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotReloadCommand,         "", NULL },
+        { "status",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAHBotStatusCommand,         "", NULL },
+        { NULL,             0,                  true,  NULL,                                           "", NULL }
+    };
+
+    static ChatCommand auctionCommandTable[] =
+    {
+        { "alliance",       SEC_ADMINISTRATOR,  false, &ChatHandler::HandleAuctionAllianceCommand,     "", NULL },
+        { "goblin",         SEC_ADMINISTRATOR,  false, &ChatHandler::HandleAuctionGoblinCommand,       "", NULL },
+        { "horde",          SEC_ADMINISTRATOR,  false, &ChatHandler::HandleAuctionHordeCommand,        "", NULL },
+        { "item",           SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleAuctionItemCommand,         "", NULL },
+        { "",               SEC_ADMINISTRATOR,  false, &ChatHandler::HandleAuctionCommand,             "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand banCommandTable[] =
+    {
+        { "account",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleBanAccountCommand,          "", NULL },
+        { "character",      SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleBanCharacterCommand,        "", NULL },
+        { "ip",             SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleBanIPCommand,               "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand baninfoCommandTable[] =
+    {
+        { "account",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleBanInfoAccountCommand,      "", NULL },
+        { "character",      SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleBanInfoCharacterCommand,    "", NULL },
+        { "ip",             SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleBanInfoIPCommand,           "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand banlistCommandTable[] =
+    {
+        { "account",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleBanListAccountCommand,      "", NULL },
+        { "character",      SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleBanListCharacterCommand,    "", NULL },
+        { "ip",             SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleBanListIPCommand,           "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand castCommandTable[] =
+    {
+        { "back",           SEC_ADMINISTRATOR,  false, &ChatHandler::HandleCastBackCommand,            "", NULL },
+        { "dist",           SEC_ADMINISTRATOR,  false, &ChatHandler::HandleCastDistCommand,            "", NULL },
+        { "self",           SEC_ADMINISTRATOR,  false, &ChatHandler::HandleCastSelfCommand,            "", NULL },
+        { "target",         SEC_ADMINISTRATOR,  false, &ChatHandler::HandleCastTargetCommand,          "", NULL },
+        { "",               SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleCastCommand,                "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand characterDeletedCommandTable[] =
+    {
+        { "delete",         SEC_CONSOLE,        true,  &ChatHandler::HandleCharacterDeletedDeleteCommand, "", NULL },
+        { "list",           SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleCharacterDeletedListCommand, "", NULL },
+        { "restore",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleCharacterDeletedRestoreCommand, "", NULL },
+        { "old",            SEC_CONSOLE,        true,  &ChatHandler::HandleCharacterDeletedOldCommand, "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand characterCommandTable[] =
+    {
+        { "deleted",        SEC_GAMEMASTER,     true,  NULL,                                           "", characterDeletedCommandTable},
+        { "erase",          SEC_CONSOLE,        true,  &ChatHandler::HandleCharacterEraseCommand,      "", NULL },
+        { "level",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleCharacterLevelCommand,      "", NULL },
+        { "rename",         SEC_GAMEMASTER,     true,  &ChatHandler::HandleCharacterRenameCommand,     "", NULL },
+        { "reputation",     SEC_GAMEMASTER,     true,  &ChatHandler::HandleCharacterReputationCommand, "", NULL },
+        { "titles",         SEC_GAMEMASTER,     true,  &ChatHandler::HandleCharacterTitlesCommand,     "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand debugPlayCommandTable[] =
+    {
+        { "cinematic",      SEC_MODERATOR,      false, &ChatHandler::HandleDebugPlayCinematicCommand,       "", NULL },
+        { "sound",          SEC_MODERATOR,      false, &ChatHandler::HandleDebugPlaySoundCommand,           "", NULL },
+        { NULL,             0,                  false, NULL,                                                "", NULL }
+    };
+
+    static ChatCommand debugSendCommandTable[] =
+    {
+        { "buyerror",       SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSendBuyErrorCommand,        "", NULL },
+        { "channelnotify",  SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSendChannelNotifyCommand,   "", NULL },
+        { "chatmmessage",   SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSendChatMsgCommand,         "", NULL },
+        { "equiperror",     SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSendEquipErrorCommand,      "", NULL },
+        { "opcode",         SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSendOpcodeCommand,          "", NULL },
+        { "poi",            SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSendPoiCommand,             "", NULL },
+        { "qpartymsg",      SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSendQuestPartyMsgCommand,   "", NULL },
+        { "qinvalidmsg",    SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSendQuestInvalidMsgCommand, "", NULL },
+        { "sellerror",      SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSendSellErrorCommand,       "", NULL },
+        { "spellfail",      SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSendSpellFailCommand,       "", NULL },
+        { NULL,             0,                  false, NULL,                                                "", NULL }
+    };
+
+    static ChatCommand debugCommandTable[] =
+    {
+        { "anim",           SEC_GAMEMASTER,     false, &ChatHandler::HandleDebugAnimCommand,                "", NULL },
+        { "arena",          SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugArenaCommand,               "", NULL },
+        { "bg",             SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugBattlegroundCommand,        "", NULL },
+        { "getitemstate",   SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugGetItemStateCommand,        "", NULL },
+        { "lootrecipient",  SEC_GAMEMASTER,     false, &ChatHandler::HandleDebugGetLootRecipientCommand,    "", NULL },
+        { "getitemvalue",   SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugGetItemValueCommand,        "", NULL },
+        { "getvalue",       SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugGetValueCommand,            "", NULL },
+        { "minion",         SEC_GAMEMASTER,     false, &ChatHandler::HandleDebugMinionCommand,              "", NULL },
+        { "moditemvalue",   SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugModItemValueCommand,        "", NULL },
+        { "modvalue",       SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugModValueCommand,            "", NULL },
+        { "play",           SEC_MODERATOR,      false, NULL,                                                "", debugPlayCommandTable },
+        { "recv",           SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugRecvOpcodeCommand,          "", NULL },
+        { "send",           SEC_ADMINISTRATOR,  false, NULL,                                                "", debugSendCommandTable },
+        { "setaurastate",   SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSetAuraStateCommand,        "", NULL },
+        { "setitemvalue",   SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSetItemValueCommand,        "", NULL },
+        { "setvalue",       SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSetValueCommand,            "", NULL },
+        { "spellcheck",     SEC_CONSOLE,        true,  &ChatHandler::HandleDebugSpellCheckCommand,          "", NULL },
+        { "spellcoefs",     SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleDebugSpellCoefsCommand,          "", NULL },
+        { "spellmods",      SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugSpellModsCommand,           "", NULL },
+        { "uws",            SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDebugUpdateWorldStateCommand,    "", NULL },
+        { NULL,             0,                  false, NULL,                                                "", NULL }
+    };
+
+    static ChatCommand eventCommandTable[] =
+    {
+        { "list",           SEC_GAMEMASTER,     true,  &ChatHandler::HandleEventListCommand,           "", NULL },
+        { "start",          SEC_GAMEMASTER,     true,  &ChatHandler::HandleEventStartCommand,          "", NULL },
+        { "stop",           SEC_GAMEMASTER,     true,  &ChatHandler::HandleEventStopCommand,           "", NULL },
+        { "",               SEC_GAMEMASTER,     true,  &ChatHandler::HandleEventInfoCommand,           "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand gmCommandTable[] =
+    {
+        { "chat",           SEC_MODERATOR,      false, &ChatHandler::HandleGMChatCommand,              "", NULL },
+        { "fly",            SEC_ADMINISTRATOR,  false, &ChatHandler::HandleGMFlyCommand,               "", NULL },
+        { "ingame",         SEC_PLAYER,         true,  &ChatHandler::HandleGMListIngameCommand,        "", NULL },
+        { "list",           SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleGMListFullCommand,          "", NULL },
+        { "visible",        SEC_MODERATOR,      false, &ChatHandler::HandleGMVisibleCommand,           "", NULL },
+        { "setview",        SEC_MODERATOR,      false, &ChatHandler::HandleSetViewCommand,             "", NULL },
+        { "",               SEC_MODERATOR,      false, &ChatHandler::HandleGMCommand,                  "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand goCommandTable[] =
+    {
+        { "creature",       SEC_MODERATOR,      false, &ChatHandler::HandleGoCreatureCommand,          "", NULL },
+        { "graveyard",      SEC_MODERATOR,      false, &ChatHandler::HandleGoGraveyardCommand,         "", NULL },
+        { "grid",           SEC_MODERATOR,      false, &ChatHandler::HandleGoGridCommand,              "", NULL },
+        { "object",         SEC_MODERATOR,      false, &ChatHandler::HandleGoObjectCommand,            "", NULL },
+        { "taxinode",       SEC_MODERATOR,      false, &ChatHandler::HandleGoTaxinodeCommand,          "", NULL },
+        { "trigger",        SEC_MODERATOR,      false, &ChatHandler::HandleGoTriggerCommand,           "", NULL },
+        { "zonexy",         SEC_MODERATOR,      false, &ChatHandler::HandleGoZoneXYCommand,            "", NULL },
+        { "xy",             SEC_MODERATOR,      false, &ChatHandler::HandleGoXYCommand,                "", NULL },
+        { "xyz",            SEC_MODERATOR,      false, &ChatHandler::HandleGoXYZCommand,               "", NULL },
+        { "",               SEC_MODERATOR,      false, &ChatHandler::HandleGoCommand,                  "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand gobjectCommandTable[] =
+    {
+        { "add",            SEC_GAMEMASTER,     false, &ChatHandler::HandleGameObjectAddCommand,       "", NULL },
+        { "anim",           SEC_GAMEMASTER,     false, &ChatHandler::HandleGameObjectAnimationCommand, "", NULL },
+        { "delete",         SEC_GAMEMASTER,     false, &ChatHandler::HandleGameObjectDeleteCommand,    "", NULL },
+        { "lootstate",      SEC_GAMEMASTER,     false, &ChatHandler::HandleGameObjectLootstateCommand, "", NULL },
+        { "move",           SEC_GAMEMASTER,     false, &ChatHandler::HandleGameObjectMoveCommand,      "", NULL },
+        { "near",           SEC_GAMEMASTER,     false, &ChatHandler::HandleGameObjectNearCommand,      "", NULL },
+        { "state",          SEC_GAMEMASTER,     false, &ChatHandler::HandleGameObjectStateCommand,     "", NULL },
+        { "target",         SEC_GAMEMASTER,     false, &ChatHandler::HandleGameObjectTargetCommand,    "", NULL },
+        { "turn",           SEC_GAMEMASTER,     false, &ChatHandler::HandleGameObjectTurnCommand,      "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand gridCommandTable[] =
+    {
+        { "info",           SEC_GAMEMASTER,     false, &ChatHandler::HandleGridInfoCommand,            "", NULL },
+        { "anchors",        SEC_GAMEMASTER,     false, &ChatHandler::HandleGridAnchorsCommand,         "", NULL },
+        { "lwstats",        SEC_GAMEMASTER,     false, &ChatHandler::HandleGridLwStatsCommand,         "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand guildCommandTable[] =
+    {
+        { "create",         SEC_GAMEMASTER,     true,  &ChatHandler::HandleGuildCreateCommand,         "", NULL },
+        { "delete",         SEC_GAMEMASTER,     true,  &ChatHandler::HandleGuildDeleteCommand,         "", NULL },
+        { "invite",         SEC_GAMEMASTER,     true,  &ChatHandler::HandleGuildInviteCommand,         "", NULL },
+        { "uninvite",       SEC_GAMEMASTER,     true,  &ChatHandler::HandleGuildUninviteCommand,       "", NULL },
+        { "rank",           SEC_GAMEMASTER,     true,  &ChatHandler::HandleGuildRankCommand,           "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    //static ChatCommand honorCommandTable[] =
+    //{
+    //    { "add",            SEC_GAMEMASTER,     true,  &ChatHandler::HandleHonorAddCommand,            "", NULL },
+    //    { "addkill",        SEC_GAMEMASTER,     false, &ChatHandler::HandleHonorAddKillCommand,        "", NULL },
+    //    { "show",           SEC_GAMEMASTER,     false, &ChatHandler::HandleHonorShow,                  "", NULL },
+    //    { "update",         SEC_GAMEMASTER,     true,  &ChatHandler::HandleHonorUpdateCommand,         "", NULL },
+    //    { NULL,             0,                  false, NULL,                                           "", NULL }
+    //};
+
+    static ChatCommand instanceCommandTable[] =
+    {
+        { "listbinds",      SEC_ADMINISTRATOR,  false, &ChatHandler::HandleInstanceListBindsCommand,   "", NULL },
+        { "unbind",         SEC_ADMINISTRATOR,  false, &ChatHandler::HandleInstanceUnbindCommand,      "", NULL },
+        { "stats",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleInstanceStatsCommand,       "", NULL },
+        { "savedata",       SEC_ADMINISTRATOR,  false, &ChatHandler::HandleInstanceSaveDataCommand,    "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand learnCommandTable[] =
+    {
+        { "all",            SEC_ADMINISTRATOR,  false, &ChatHandler::HandleLearnAllCommand,            "", NULL },
+        { "all_gm",         SEC_GAMEMASTER,     false, &ChatHandler::HandleLearnAllGMCommand,          "", NULL },
+        { "all_crafts",     SEC_GAMEMASTER,     false, &ChatHandler::HandleLearnAllCraftsCommand,      "", NULL },
+        { "all_default",    SEC_MODERATOR,      false, &ChatHandler::HandleLearnAllDefaultCommand,     "", NULL },
+        { "all_lang",       SEC_MODERATOR,      false, &ChatHandler::HandleLearnAllLangCommand,        "", NULL },
+        { "all_myclass",    SEC_ADMINISTRATOR,  false, &ChatHandler::HandleLearnAllMyClassCommand,     "", NULL },
+        { "all_myspells",   SEC_ADMINISTRATOR,  false, &ChatHandler::HandleLearnAllMySpellsCommand,    "", NULL },
+        { "all_mytalents",  SEC_ADMINISTRATOR,  false, &ChatHandler::HandleLearnAllMyTalentsCommand,   "", NULL },
+        { "all_recipes",    SEC_GAMEMASTER,     false, &ChatHandler::HandleLearnAllRecipesCommand,     "", NULL },
+        { "",               SEC_ADMINISTRATOR,  false, &ChatHandler::HandleLearnCommand,               "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand listCommandTable[] =
+    {
+        { "auras",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleListAurasCommand,           "", NULL },
+        { "creature",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleListCreatureCommand,        "", NULL },
+        { "item",           SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleListItemCommand,            "", NULL },
+        { "object",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleListObjectCommand,          "", NULL },
+        { "talents",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleListTalentsCommand,         "", NULL },
+        { "players",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleListPlayersCommand,         "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand lookupAccountCommandTable[] =
+    {
+        { "email",          SEC_GAMEMASTER,     true,  &ChatHandler::HandleLookupAccountEmailCommand,  "", NULL },
+        { "ip",             SEC_GAMEMASTER,     true,  &ChatHandler::HandleLookupAccountIpCommand,     "", NULL },
+        { "name",           SEC_GAMEMASTER,     true,  &ChatHandler::HandleLookupAccountNameCommand,   "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand lookupPlayerCommandTable[] =
+    {
+        { "account",        SEC_GAMEMASTER,     true,  &ChatHandler::HandleLookupPlayerAccountCommand, "", NULL },
+        { "email",          SEC_GAMEMASTER,     true,  &ChatHandler::HandleLookupPlayerEmailCommand,   "", NULL },
+        { "ip",             SEC_GAMEMASTER,     true,  &ChatHandler::HandleLookupPlayerIpCommand,      "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand lookupCommandTable[] =
+    {
+        { "account",        SEC_GAMEMASTER,     true,  NULL,                                           "", lookupAccountCommandTable },
+        { "area",           SEC_MODERATOR,      true,  &ChatHandler::HandleLookupAreaCommand,          "", NULL },
+        { "creature",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleLookupCreatureCommand,      "", NULL },
+        { "event",          SEC_GAMEMASTER,     true,  &ChatHandler::HandleLookupEventCommand,         "", NULL },
+        { "faction",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleLookupFactionCommand,       "", NULL },
+        { "item",           SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleLookupItemCommand,          "", NULL },
+        { "itemset",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleLookupItemSetCommand,       "", NULL },
+        { "object",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleLookupObjectCommand,        "", NULL },
+        { "quest",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleLookupQuestCommand,         "", NULL },
+        { "player",         SEC_GAMEMASTER,     true,  NULL,                                           "", lookupPlayerCommandTable },
+        { "pool",           SEC_GAMEMASTER,     true,  &ChatHandler::HandleLookupPoolCommand,          "", NULL },
+        { "skill",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleLookupSkillCommand,         "", NULL },
+        { "spell",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleLookupSpellCommand,         "", NULL },
+        { "taxinode",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleLookupTaxiNodeCommand,      "", NULL },
+        { "tele",           SEC_MODERATOR,      true,  &ChatHandler::HandleLookupTeleCommand,          "", NULL },
+        { "title",          SEC_GAMEMASTER,     true,  &ChatHandler::HandleLookupTitleCommand,         "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand mmapCommandTable[] =
+    {
+        { "path",           SEC_GAMEMASTER,     false, &ChatHandler::HandleMmapPathCommand,            "", NULL },
+        { "loc",            SEC_GAMEMASTER,     false, &ChatHandler::HandleMmapLocCommand,             "", NULL },
+        { "loadedtiles",    SEC_GAMEMASTER,     false, &ChatHandler::HandleMmapLoadedTilesCommand,     "", NULL },
+        { "stats",          SEC_GAMEMASTER,     false, &ChatHandler::HandleMmapStatsCommand,           "", NULL },
+        { "testarea",       SEC_GAMEMASTER,     false, &ChatHandler::HandleMmapTestArea,               "", NULL },
+        { "testheight",     SEC_GAMEMASTER,     false, &ChatHandler::HandleMmapTestHeight,             "", NULL },
+        { "",               SEC_ADMINISTRATOR,  false, &ChatHandler::HandleMmap,                       "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand modifyCommandTable[] =
+    {
+        { "hp",             SEC_MODERATOR,      true,  &ChatHandler::HandleModifyHPCommand,            "", NULL },
+        { "mana",           SEC_MODERATOR,      true,  &ChatHandler::HandleModifyManaCommand,          "", NULL },
+        { "rage",           SEC_MODERATOR,      true,  &ChatHandler::HandleModifyRageCommand,          "", NULL },
+        { "energy",         SEC_MODERATOR,      true,  &ChatHandler::HandleModifyEnergyCommand,        "", NULL },
+        { "money",          SEC_MODERATOR,      true,  &ChatHandler::HandleModifyMoneyCommand,         "", NULL },
+        { "speed",          SEC_MODERATOR,      true,  &ChatHandler::HandleModifySpeedCommand,         "", NULL },
+        { "swim",           SEC_MODERATOR,      true,  &ChatHandler::HandleModifySwimCommand,          "", NULL },
+        { "scale",          SEC_MODERATOR,      true,  &ChatHandler::HandleModifyScaleCommand,         "", NULL },
+        { "bwalk",          SEC_MODERATOR,      true,  &ChatHandler::HandleModifyBWalkCommand,         "", NULL },
+        { "aspeed",         SEC_MODERATOR,      true,  &ChatHandler::HandleModifyASpeedCommand,        "", NULL },
+        { "faction",        SEC_MODERATOR,      true,  &ChatHandler::HandleModifyFactionCommand,       "", NULL },
+        { "tp",             SEC_MODERATOR,      true,  &ChatHandler::HandleModifyTalentCommand,        "", NULL },
+        { "mount",          SEC_MODERATOR,      true,  &ChatHandler::HandleModifyMountCommand,         "", NULL },
+        { "honor",          SEC_MODERATOR,      true,  &ChatHandler::HandleModifyHonorCommand,         "", NULL },
+        { "rep",            SEC_GAMEMASTER,     true,  &ChatHandler::HandleModifyRepCommand,           "", NULL },
+        { "drunk",          SEC_MODERATOR,      false, &ChatHandler::HandleModifyDrunkCommand,         "", NULL },
+        { "standstate",     SEC_GAMEMASTER,     true,  &ChatHandler::HandleModifyStandStateCommand,    "", NULL },
+        { "morph",          SEC_GAMEMASTER,     true,  &ChatHandler::HandleModifyMorphCommand,         "", NULL },
+        { "gender",         SEC_GAMEMASTER,     true,  &ChatHandler::HandleModifyGenderCommand,        "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    // .trans npc add <entry> [<movement_type>] [<wander_distance>]
+    static ChatCommand npcCommandTable[] =
+    {
+        { "add",            SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcAddCommand,              "", NULL },
+        { "additem",        SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcAddVendorItemCommand,    "", NULL },
+        { "aiinfo",         SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcAIInfoCommand,           "", NULL },
+        { "allowmove",      SEC_ADMINISTRATOR,  false, &ChatHandler::HandleNpcAllowMovementCommand,    "", NULL },
+        { "changeentry",    SEC_ADMINISTRATOR,  false, &ChatHandler::HandleNpcChangeEntryCommand,      "", NULL },
+        { "changelevel",    SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcChangeLevelCommand,      "", NULL },
+        { "delete",         SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcDeleteCommand,           "", NULL },
+        { "delitem",        SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcDelVendorItemCommand,    "", NULL },
+        { "factionid",      SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcFactionIdCommand,        "", NULL },
+        { "flag",           SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcFlagCommand,             "", NULL },
+        { "follow",         SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcFollowCommand,           "", NULL },
+        { "info",           SEC_ADMINISTRATOR,  false, &ChatHandler::HandleNpcInfoCommand,             "", NULL },
+        { "move",           SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcMoveCommand,             "", NULL },
+        { "playemote",      SEC_ADMINISTRATOR,  false, &ChatHandler::HandleNpcPlayEmoteCommand,        "", NULL },
+        { "setmodel",       SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcSetModelCommand,         "", NULL },
+        { "setmovetype",    SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcSetMoveTypeCommand,      "", NULL },
+        { "spawndist",      SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcSpawnDistCommand,        "", NULL },
+        { "spawntime",      SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcSpawnTimeCommand,        "", NULL },
+        { "say",            SEC_MODERATOR,      false, &ChatHandler::HandleNpcSayCommand,              "", NULL },
+        { "textemote",      SEC_MODERATOR,      false, &ChatHandler::HandleNpcTextEmoteCommand,        "", NULL },
+        { "unfollow",       SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcUnFollowCommand,         "", NULL },
+        { "watch",          SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcWatchCommand,            "", NULL },
+        { "whisper",        SEC_MODERATOR,      false, &ChatHandler::HandleNpcWhisperCommand,          "", NULL },
+        { "yell",           SEC_MODERATOR,      false, &ChatHandler::HandleNpcYellCommand,             "", NULL },
+        { "tame",           SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcTameCommand,             "", NULL },
+        { "setdeathstate",  SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcSetDeathStateCommand,    "", NULL },
+
+        //{ TODO: fix or remove this commands
+        { "addweapon",      SEC_ADMINISTRATOR,  false, &ChatHandler::HandleNpcAddWeaponCommand,        "", NULL },
+        { "name",           SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcNameCommand,             "", NULL },
+        { "subname",        SEC_GAMEMASTER,     false, &ChatHandler::HandleNpcSubNameCommand,          "", NULL },
+        //}
+
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand pdumpCommandTable[] =
+    {
+        { "load",           SEC_ADMINISTRATOR,  true,  &ChatHandler::HandlePDumpLoadCommand,           "", NULL },
+        { "write",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandlePDumpWriteCommand,          "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand poolCommandTable[] =
+    {
+        { "list",           SEC_GAMEMASTER,     false, &ChatHandler::HandlePoolListCommand,            "", NULL },
+        { "spawns",         SEC_GAMEMASTER,     false, &ChatHandler::HandlePoolSpawnsCommand,          "", NULL },
+        { "",               SEC_GAMEMASTER,     true,  &ChatHandler::HandlePoolInfoCommand,            "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand questCommandTable[] =
+    {
+        { "add",            SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleQuestAddCommand,            "", NULL },
+        { "complete",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleQuestCompleteCommand,       "", NULL },
+        { "remove",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleQuestRemoveCommand,         "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand reloadCommandTable[] =
+    {
+        { "all",            SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReloadAllCommand,           "", NULL },
+        { "all_area",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReloadAllAreaCommand,       "", NULL },
+        { "all_eventai",    SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReloadAllEventAICommand,    "", NULL },
+        { "all_gossips",    SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReloadAllGossipsCommand,    "", NULL },
+        { "all_item",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReloadAllItemCommand,       "", NULL },
+        { "all_locales",    SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReloadAllLocalesCommand,    "", NULL },
+        { "all_loot",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReloadAllLootCommand,       "", NULL },
+        { "all_npc",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReloadAllNpcCommand,        "", NULL },
+        { "all_quest",      SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReloadAllQuestCommand,      "", NULL },
+        { "all_scripts",    SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReloadAllScriptsCommand,    "", NULL },
+        { "all_spell",      SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReloadAllSpellCommand,      "", NULL },
+
+        { "config",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReloadConfigCommand,        "", NULL },
+
+        { "areatrigger_quest_end",       SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadQuestAreaTriggersCommand,       "", NULL },
+        { "areatrigger_tavern",          SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadAreaTriggerTavernCommand,       "", NULL },
+        { "areatrigger_teleport",        SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadAreaTriggerTeleportCommand,     "", NULL },
+        { "autobroadcast",               SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadAutoBroadcastCommand,           "", NULL },
+        { "command",                     SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadCommandCommand,                 "", NULL },
+        { "conditions",                  SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadConditionsCommand,              "", NULL },
+        { "creature_ai_scripts",         SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadEventAIScriptsCommand,          "", NULL },
+        { "creature_ai_summons",         SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadEventAISummonsCommand,          "", NULL },
+        { "creature_ai_texts",           SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadEventAITextsCommand,            "", NULL },
+        { "creature_battleground",       SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadBattleEventCommand,             "", NULL },
+        { "creature_quest_end",          SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadCreatureQuestInvRelationsCommand, "", NULL },
+        { "creature_loot_template",      SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLootTemplatesCreatureCommand,   "", NULL },
+        { "creature_quest_start",        SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadCreatureQuestRelationsCommand,  "", NULL },
+        { "creature_template_classlevelstats", SEC_ADMINISTRATOR, true, &ChatHandler::HandleReloadCreaturesStatsCommand,     "", NULL },
+        { "db_script_string",            SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadDbScriptStringCommand,          "", NULL },
+        { "dbscripts_on_creature_death", SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadDBScriptsOnCreatureDeathCommand, "", NULL },
+        { "dbscripts_on_event",          SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadDBScriptsOnEventCommand,        "", NULL },
+        { "dbscripts_on_gossip",         SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadDBScriptsOnGossipCommand,       "", NULL },
+        { "dbscripts_on_go_use",         SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadDBScriptsOnGoUseCommand,        "", NULL },
+        { "dbscripts_on_quest_end",      SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadDBScriptsOnQuestEndCommand,     "", NULL },
+        { "dbscripts_on_quest_start",    SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadDBScriptsOnQuestStartCommand,   "", NULL },
+        { "dbscripts_on_spell",          SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadDBScriptsOnSpellCommand,        "", NULL },
+        { "disables",                    SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadDisablesCommand,                "", NULL },
+        { "disenchant_loot_template",    SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLootTemplatesDisenchantCommand, "", NULL },
+        { "fishing_loot_template",       SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLootTemplatesFishingCommand,    "", NULL },
+        { "game_graveyard_zone",         SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadGameGraveyardZoneCommand,       "", NULL },
+        { "game_tele",                   SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadGameTeleCommand,                "", NULL },
+        { "gameobject_quest_end",        SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadGOQuestInvRelationsCommand,     "", NULL },
+        { "gameobject_loot_template",    SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLootTemplatesGameobjectCommand, "", NULL },
+        { "gameobject_quest_start",      SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadGOQuestRelationsCommand,        "", NULL },
+        { "gameobject_battleground",     SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadBattleEventCommand,             "", NULL },
+        { "gossip_menu",                 SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadGossipMenuCommand,              "", NULL },
+        { "gossip_menu_option",          SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadGossipMenuCommand,              "", NULL },
+        { "item_enchantment_template",   SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadItemEnchantementsCommand,       "", NULL },
+        { "item_loot_template",          SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLootTemplatesItemCommand,       "", NULL },
+        { "item_required_target",        SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadItemRequiredTragetCommand,      "", NULL },
+        { "locales_creature",            SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLocalesCreatureCommand,         "", NULL },
+        { "locales_gameobject",          SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLocalesGameobjectCommand,       "", NULL },
+        { "locales_gossip_menu_option",  SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLocalesGossipMenuOptionCommand, "", NULL },
+        { "locales_item",                SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLocalesItemCommand,             "", NULL },
+        { "locales_npc_text",            SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLocalesNpcTextCommand,          "", NULL },
+        { "locales_page_text",           SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLocalesPageTextCommand,         "", NULL },
+        { "locales_points_of_interest",  SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLocalesPointsOfInterestCommand, "", NULL },
+        { "locales_quest",               SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLocalesQuestCommand,            "", NULL },
+        { "locales_command",             SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLocalesCommandHelpCommand,            "", NULL },
+        { "mail_level_reward",           SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadMailLevelRewardCommand,         "", NULL },
+        { "mail_loot_template",          SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLootTemplatesMailCommand,       "", NULL },
+        { "mangos_string",               SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadMangosStringCommand,            "", NULL },
+        { "npc_text",                    SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadNpcTextCommand,                 "", NULL },
+        { "npc_trainer",                 SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadNpcTrainerCommand,              "", NULL },
+        { "npc_vendor",                  SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadNpcVendorCommand,               "", NULL },
+        { "page_text",                   SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadPageTextsCommand,               "", NULL },
+        { "pickpocketing_loot_template", SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLootTemplatesPickpocketingCommand, "", NULL},
+        { "points_of_interest",          SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadPointsOfInterestCommand,        "", NULL },
+        { "prospecting_loot_template",   SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLootTemplatesProspectingCommand, "", NULL },
+        { "quest_template",              SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadQuestTemplateCommand,           "", NULL },
+        { "reference_loot_template",     SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLootTemplatesReferenceCommand,  "", NULL },
+        { "reserved_name",               SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadReservedNameCommand,            "", NULL },
+        { "reputation_reward_rate",      SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadReputationRewardRateCommand,    "", NULL },
+        { "reputation_spillover_template", SEC_ADMINISTRATOR, true, &ChatHandler::HandleReloadReputationSpilloverTemplateCommand, "", NULL },
+        { "script_binding",              SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadScriptBindingCommand,           "", NULL },
+        { "skill_discovery_template",    SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSkillDiscoveryTemplateCommand,  "", NULL },
+        { "skill_extra_item_template",   SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSkillExtraItemTemplateCommand,  "", NULL },
+        { "skill_fishing_base_level",    SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSkillFishingBaseLevelCommand,   "", NULL },
+        { "skinning_loot_template",      SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadLootTemplatesSkinningCommand,   "", NULL },
+        { "spell_affect",                SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellAffectCommand,             "", NULL },
+        { "spell_area",                  SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellAreaCommand,               "", NULL },
+        { "spell_bonus_data",            SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellBonusesCommand,            "", NULL },
+        { "spell_chain",                 SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellChainCommand,              "", NULL },
+        { "spell_elixir",                SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellElixirCommand,             "", NULL },
+        { "spell_learn_spell",           SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellLearnSpellCommand,         "", NULL },
+        { "spell_linked",                SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellLinkedCommand,             "", NULL },
+        { "spell_pet_auras",             SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellPetAurasCommand,           "", NULL },
+        { "spell_proc_event",            SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellProcEventCommand,          "", NULL },
+        { "spell_proc_item_enchant",     SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellProcItemEnchantCommand,    "", NULL },
+        { "spell_script_target",         SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellScriptTargetCommand,       "", NULL },
+        { "spell_target_position",       SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellTargetPositionCommand,     "", NULL },
+        { "spell_threats",               SEC_ADMINISTRATOR, true,  &ChatHandler::HandleReloadSpellThreatsCommand,            "", NULL },
+
+        { NULL,                          0,                 false, NULL,                                                     "", NULL }
+    };
+
+    static ChatCommand resetCommandTable[] =
+    {
+        { "honor",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleResetHonorCommand,          "", NULL },
+        { "level",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleResetLevelCommand,          "", NULL },
+        { "spells",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleResetSpellsCommand,         "", NULL },
+        { "stats",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleResetStatsCommand,          "", NULL },
+        { "talents",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleResetTalentsCommand,        "", NULL },
+        //{ "items",          SEC_ADMINISTRATOR,  false, &ChatHandler::HandleResetItemsCommand,         "", NULL },
+        //{ "mail",           SEC_ADMINISTRATOR,  false, &ChatHandler::HandleResetMailCommand,           "", NULL },
+        { "all",            SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleResetAllCommand,            "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand sendMassCommandTable[] =
+    {
+        { "items",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleSendMassItemsCommand,       "", NULL },
+        { "mail",           SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleSendMassMailCommand,        "", NULL },
+        { "money",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleSendMassMoneyCommand,       "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand sendCommandTable[] =
+    {
+        { "mass",           SEC_ADMINISTRATOR,  true,  NULL,                                           "", sendMassCommandTable },
+
+        { "items",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleSendItemsCommand,           "", NULL },
+        { "mail",           SEC_MODERATOR,      true,  &ChatHandler::HandleSendMailCommand,            "", NULL },
+        { "message",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleSendMessageCommand,         "", NULL },
+        { "money",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleSendMoneyCommand,           "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand serverIdleRestartCommandTable[] =
+    {
+        { "cancel",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleServerShutDownCancelCommand, "", NULL },
+        { ""   ,            SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleServerIdleRestartCommand,   "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand serverIdleShutdownCommandTable[] =
+    {
+        { "cancel",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleServerShutDownCancelCommand, "", NULL },
+        { ""   ,            SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleServerIdleShutDownCommand,  "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand serverRestartCommandTable[] =
+    {
+        { "cancel",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleServerShutDownCancelCommand, "", NULL },
+        { ""   ,            SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleServerRestartCommand,       "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand serverShutdownCommandTable[] =
+    {
+        { "cancel",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleServerShutDownCancelCommand, "", NULL },
+        { ""   ,            SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleServerShutDownCommand,      "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand serverLogCommandTable[] =
+    {
+        { "filter",         SEC_CONSOLE,        true,  &ChatHandler::HandleServerLogFilterCommand,     "", NULL },
+        { "level",          SEC_CONSOLE,        true,  &ChatHandler::HandleServerLogLevelCommand,      "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand serverSetCommandTable[] =
+    {
+        { "motd",           SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleServerSetMotdCommand,       "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand serverCommandTable[] =
+    {
+        { "corpses",        SEC_GAMEMASTER,     true,  &ChatHandler::HandleServerCorpsesCommand,       "", NULL },
+        { "exit",           SEC_CONSOLE,        true,  &ChatHandler::HandleServerExitCommand,          "", NULL },
+        { "idlerestart",    SEC_ADMINISTRATOR,  true,  NULL,                                           "", serverIdleRestartCommandTable },
+        { "idleshutdown",   SEC_ADMINISTRATOR,  true,  NULL,                                           "", serverIdleShutdownCommandTable },
+        { "info",           SEC_PLAYER,         true,  &ChatHandler::HandleServerInfoCommand,          "", NULL },
+        { "log",            SEC_CONSOLE,        true,  NULL,                                           "", serverLogCommandTable },
+        { "motd",           SEC_PLAYER,         true,  &ChatHandler::HandleServerMotdCommand,          "", NULL },
+        { "plimit",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleServerPLimitCommand,        "", NULL },
+        { "resetallraid",   SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleServerResetAllRaidCommand,  "", NULL },
+        { "restart",        SEC_ADMINISTRATOR,  true,  NULL,                                           "", serverRestartCommandTable },
+        { "shutdown",       SEC_ADMINISTRATOR,  true,  NULL,                                           "", serverShutdownCommandTable },
+        { "set",            SEC_ADMINISTRATOR,  true,  NULL,                                           "", serverSetCommandTable },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand selectCommandTable[] =
+    {
+        { "player",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleSelectPlayerCommand,        "", NULL },
+        { "clear",          SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleSelectClearCommand,         "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand teleCommandTable[] =
+    {
+        { "add",            SEC_ADMINISTRATOR,  false, &ChatHandler::HandleTeleAddCommand,             "", NULL },
+        { "del",            SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleTeleDelCommand,             "", NULL },
+        { "name",           SEC_MODERATOR,      true,  &ChatHandler::HandleTeleNameCommand,            "", NULL },
+        { "group",          SEC_MODERATOR,      false, &ChatHandler::HandleTeleGroupCommand,           "", NULL },
+        { "",               SEC_MODERATOR,      false, &ChatHandler::HandleTeleCommand,                "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand ticketCommandTable[] =
+    {
+        { "accept",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleTicketAcceptCommand,         "", NULL },
+        { "close",          SEC_GAMEMASTER,     true,  &ChatHandler::HandleTicketCloseCommand,          "", NULL },
+        { "delete",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleTicketDeleteCommand,         "", NULL },
+        { "info",           SEC_GAMEMASTER,     true,  &ChatHandler::HandleTicketInfoCommand,           "", NULL },
+        { "list",           SEC_GAMEMASTER,     true,  &ChatHandler::HandleTicketListCommand,           "", NULL },
+        { "meaccept",       SEC_GAMEMASTER,     false, &ChatHandler::HandleTicketMeAcceptCommand,       "", NULL },
+        { "onlinelist",     SEC_GAMEMASTER,     true,  &ChatHandler::HandleTicketOnlineListCommand,     "", NULL },
+        { "respond",        SEC_GAMEMASTER,     true,  &ChatHandler::HandleTicketRespondCommand,        "", NULL },
+        { "show",           SEC_GAMEMASTER,     true,  &ChatHandler::HandleTicketShowCommand,           "", NULL },
+        { "surveyclose",    SEC_GAMEMASTER,     true,  &ChatHandler::HandleTickerSurveyClose,           "", NULL },
+        { NULL,             0,                  false, NULL,                                            "", NULL }
+    };
+
+    static ChatCommand titlesCommandTable[] =
+    {
+        { "add",            SEC_GAMEMASTER,     false, &ChatHandler::HandleTitlesAddCommand,           "", NULL },
+        { "current",        SEC_GAMEMASTER,     false, &ChatHandler::HandleTitlesCurrentCommand,       "", NULL },
+        { "remove",         SEC_GAMEMASTER,     false, &ChatHandler::HandleTitlesRemoveCommand,        "", NULL },
+        { "setmask",        SEC_GAMEMASTER,     false, &ChatHandler::HandleTitlesSetMaskCommand,       "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand triggerCommandTable[] =
+    {
+        { "active",         SEC_GAMEMASTER,     false, &ChatHandler::HandleTriggerActiveCommand,       "", NULL },
+        { "near",           SEC_GAMEMASTER,     false, &ChatHandler::HandleTriggerNearCommand,         "", NULL },
+        { "",               SEC_GAMEMASTER,     true,  &ChatHandler::HandleTriggerCommand,             "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand unbanCommandTable[] =
+    {
+        { "account",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleUnBanAccountCommand,      "", NULL },
+        { "character",      SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleUnBanCharacterCommand,    "", NULL },
+        { "ip",             SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleUnBanIPCommand,           "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand wpCommandTable[] =
+    {
+        { "show",           SEC_GAMEMASTER,     false, &ChatHandler::HandleWpShowCommand,              "", NULL },
+        { "add",            SEC_GAMEMASTER,     false, &ChatHandler::HandleWpAddCommand,               "", NULL },
+        { "modify",         SEC_GAMEMASTER,     false, &ChatHandler::HandleWpModifyCommand,            "", NULL },
+        { "export",         SEC_ADMINISTRATOR,  false, &ChatHandler::HandleWpExportCommand,            "", NULL },
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    static ChatCommand commandTable[] =
+    {
+        { "account",        SEC_PLAYER,         true,  NULL,                                           "", accountCommandTable  },
+        { "auction",        SEC_ADMINISTRATOR,  false, NULL,                                           "", auctionCommandTable  },
+        { "ahbot",          SEC_ADMINISTRATOR,  true,  NULL,                                           "", ahbotCommandTable    },
+        { "cast",           SEC_ADMINISTRATOR,  true,  NULL,                                           "", castCommandTable     },
+        { "character",      SEC_GAMEMASTER,     true,  NULL,                                           "", characterCommandTable},
+        { "debug",          SEC_MODERATOR,      true,  NULL,                                           "", debugCommandTable    },
+        { "event",          SEC_GAMEMASTER,     false, NULL,                                           "", eventCommandTable    },
+        { "gm",             SEC_PLAYER,         true,  NULL,                                           "", gmCommandTable       },
+        //{ "honor",          SEC_GAMEMASTER,     false, NULL,                                           "", honorCommandTable    },
+        { "go",             SEC_MODERATOR,      false, NULL,                                           "", goCommandTable       },
+        { "gobject",        SEC_GAMEMASTER,     false, NULL,                                           "", gobjectCommandTable  },
+        { "grid",           SEC_GAMEMASTER,     false, NULL,                                           "", gridCommandTable     },
+        { "guild",          SEC_GAMEMASTER,     true,  NULL,                                           "", guildCommandTable    },
+        { "instance",       SEC_ADMINISTRATOR,  true,  NULL,                                           "", instanceCommandTable },
+        { "learn",          SEC_MODERATOR,      false, NULL,                                           "", learnCommandTable    },
+        { "list",           SEC_ADMINISTRATOR,  true,  NULL,                                           "", listCommandTable     },
+        { "lookup",         SEC_MODERATOR,      true,  NULL,                                           "", lookupCommandTable   },
+        { "modify",         SEC_MODERATOR,      false, NULL,                                           "", modifyCommandTable   },
+        { "npc",            SEC_MODERATOR,      false, NULL,                                           "", npcCommandTable      },
+        { "pool",           SEC_GAMEMASTER,     true,  NULL,                                           "", poolCommandTable     },
+        { "pdump",          SEC_ADMINISTRATOR,  true,  NULL,                                           "", pdumpCommandTable    },
+        { "quest",          SEC_ADMINISTRATOR,  true,  NULL,                                           "", questCommandTable    },
+        { "reload",         SEC_ADMINISTRATOR,  true,  NULL,                                           "", reloadCommandTable   },
+        { "reset",          SEC_ADMINISTRATOR,  true,  NULL,                                           "", resetCommandTable    },
+        { "select",         SEC_ADMINISTRATOR,  true,  NULL,                                           "", selectCommandTable   },
+        { "server",         SEC_PLAYER,         true,  NULL,                                           "", serverCommandTable   },
+        { "tele",           SEC_MODERATOR,      true,  NULL,                                           "", teleCommandTable     },
+        { "titles",         SEC_GAMEMASTER,     false, NULL,                                           "", titlesCommandTable   },
+        { "trigger",        SEC_GAMEMASTER,     false, NULL,                                           "", triggerCommandTable  },
+        { "wp",             SEC_GAMEMASTER,     false, NULL,                                           "", wpCommandTable       },
+
+        { "aura",           SEC_ADMINISTRATOR,  false, &ChatHandler::HandleAuraCommand,                "", NULL },
+        { "unaura",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleUnAuraCommand,              "", NULL },
+        { "announce",       SEC_MODERATOR,      true,  &ChatHandler::HandleAnnounceCommand,            "", NULL },
+        { "notify",         SEC_MODERATOR,      true,  &ChatHandler::HandleNotifyCommand,              "", NULL },
+        { "appear",         SEC_MODERATOR,      false, &ChatHandler::HandleAppearCommand,              "", NULL },
+        { "summon",         SEC_MODERATOR,      false, &ChatHandler::HandleSummonCommand,              "", NULL },
+        { "groupgo",        SEC_MODERATOR,      false, &ChatHandler::HandleGroupgoCommand,             "", NULL },
+        { "commands",       SEC_PLAYER,         true,  &ChatHandler::HandleCommandsCommand,            "", NULL },
+        { "demorph",        SEC_GAMEMASTER,     true,  &ChatHandler::HandleDeMorphCommand,             "", NULL },
+        { "die",            SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleDieCommand,                 "", NULL },
+        { "revive",         SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleReviveCommand,              "", NULL },
+        { "dismount",       SEC_PLAYER,         false, &ChatHandler::HandleDismountCommand,            "", NULL },
+        { "gps",            SEC_MODERATOR,      false, &ChatHandler::HandleGPSCommand,                 "", NULL },
+        { "guid",           SEC_GAMEMASTER,     false, &ChatHandler::HandleGUIDCommand,                "", NULL },
+        { "help",           SEC_PLAYER,         true,  &ChatHandler::HandleHelpCommand,                "", NULL },
+        { "itemmove",       SEC_GAMEMASTER,     false, &ChatHandler::HandleItemMoveCommand,            "", NULL },
+        { "cooldown",       SEC_ADMINISTRATOR,  false, &ChatHandler::HandleCooldownCommand,            "", NULL },
+        { "unlearn",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleUnLearnCommand,             "", NULL },
+        { "distance",       SEC_ADMINISTRATOR,  false, &ChatHandler::HandleGetDistanceCommand,         "", NULL },
+        { "recall",         SEC_MODERATOR,      true,  &ChatHandler::HandleRecallCommand,              "", NULL },
+        { "save",           SEC_PLAYER,         false, &ChatHandler::HandleSaveCommand,                "", NULL },
+        { "saveall",        SEC_MODERATOR,      true,  &ChatHandler::HandleSaveAllCommand,             "", NULL },
+        { "kick",           SEC_GAMEMASTER,     true,  &ChatHandler::HandleKickPlayerCommand,          "", NULL },
+        { "ban",            SEC_ADMINISTRATOR,  true,  NULL,                                           "", banCommandTable      },
+        { "unban",          SEC_ADMINISTRATOR,  true,  NULL,                                           "", unbanCommandTable    },
+        { "baninfo",        SEC_ADMINISTRATOR,  false, NULL,                                           "", baninfoCommandTable  },
+        { "banlist",        SEC_ADMINISTRATOR,  true,  NULL,                                           "", banlistCommandTable  },
+        { "start",          SEC_PLAYER,         false, &ChatHandler::HandleStartCommand,               "", NULL },
+        { "taxicheat",      SEC_MODERATOR,      false, &ChatHandler::HandleTaxiCheatCommand,           "", NULL },
+        { "linkgrave",      SEC_ADMINISTRATOR,  false, &ChatHandler::HandleLinkGraveCommand,           "", NULL },
+        { "neargrave",      SEC_ADMINISTRATOR,  false, &ChatHandler::HandleNearGraveCommand,           "", NULL },
+        { "explorecheat",   SEC_ADMINISTRATOR,  false, &ChatHandler::HandleExploreCheatCommand,        "", NULL },
+        { "levelup",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleLevelUpCommand,             "", NULL },
+        { "showarea",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleShowAreaCommand,            "", NULL },
+        { "hidearea",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleHideAreaCommand,            "", NULL },
+        { "additem",        SEC_ADMINISTRATOR,  false, &ChatHandler::HandleAddItemCommand,             "", NULL },
+        { "additemset",     SEC_ADMINISTRATOR,  false, &ChatHandler::HandleAddItemSetCommand,          "", NULL },
+        { "bank",           SEC_ADMINISTRATOR,  false, &ChatHandler::HandleBankCommand,                "", NULL },
+        { "wchange",        SEC_ADMINISTRATOR,  false, &ChatHandler::HandleChangeWeatherCommand,       "", NULL },
+        { "ticket",         SEC_GAMEMASTER,     false, NULL,                                           "", ticketCommandTable   },
+        { "maxskill",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleMaxSkillCommand,            "", NULL },
+        { "setskill",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleSetSkillCommand,            "", NULL },
+        { "whispers",       SEC_MODERATOR,      false, &ChatHandler::HandleWhispersCommand,            "", NULL },
+        { "pinfo",          SEC_GAMEMASTER,     true,  &ChatHandler::HandlePInfoCommand,               "", NULL },
+        { "respawn",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleRespawnCommand,             "", NULL },
+        { "send",           SEC_MODERATOR,      true,  NULL,                                           "", sendCommandTable     },
+        { "loadscripts",    SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleLoadScriptsCommand,         "", NULL },
+        { "mute",           SEC_MODERATOR,      true,  &ChatHandler::HandleMuteCommand,                "", NULL },
+        { "unmute",         SEC_MODERATOR,      true,  &ChatHandler::HandleUnmuteCommand,              "", NULL },
+        { "movegens",       SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleMovegensCommand,            "", NULL },
+        { "cometome",       SEC_ADMINISTRATOR,  false, &ChatHandler::HandleComeToMeCommand,            "", NULL },
+        { "damage",         SEC_ADMINISTRATOR,  false, &ChatHandler::HandleDamageCommand,              "", NULL },
+        { "combatstop",     SEC_GAMEMASTER,     false, &ChatHandler::HandleCombatStopCommand,          "", NULL },
+        { "flusharenapoints", SEC_ADMINISTRATOR, false, &ChatHandler::HandleFlushArenaPointsCommand,    "", NULL },
+        { "repairitems",    SEC_GAMEMASTER,     true,  &ChatHandler::HandleRepairitemsCommand,         "", NULL },
+        { "stable",         SEC_ADMINISTRATOR,  false, &ChatHandler::HandleStableCommand,              "", NULL },
+        { "waterwalk",      SEC_GAMEMASTER,     false, &ChatHandler::HandleWaterwalkCommand,           "", NULL },
+        { "freezeplayer",   SEC_GAMEMASTER,     true,  &ChatHandler::HandleFreezePlayerCommand,        "", NULL },
+        { "unfreezeplayer", SEC_GAMEMASTER,     true,  &ChatHandler::HandleUnfreezePlayerCommand,      "", NULL },
+        { "quit",           SEC_CONSOLE,        true,  &ChatHandler::HandleQuitCommand,                "", NULL },
+        { "mmap",           SEC_GAMEMASTER,     false, NULL,                                           "", mmapCommandTable },
+#ifdef ENABLE_PLAYERBOTS
+        { "bot",            SEC_PLAYER,         false, &ChatHandler::HandlePlayerbotCommand,           "", NULL },
+        { "rndbot",         SEC_GAMEMASTER,     true,  &ChatHandler::HandleRandomPlayerbotCommand,     "", NULL },
+        { "ahbot",          SEC_GAMEMASTER,     true,  &ChatHandler::HandleAhBotCommand,               "", NULL },
+        { "gtask",          SEC_GAMEMASTER,     true,  &ChatHandler::HandleGuildTaskCommand,           "", NULL },
+#endif
+
+        { NULL,             0,                  false, NULL,                                           "", NULL }
+    };
+
+    if (load_command_table)
+    {
+        load_command_table = false;
+
+        // check hardcoded part integrity
+        CheckIntegrity(commandTable, NULL);
+
+        QueryResult* result = WorldDatabase.Query("SELECT `id`, `command_text`,`security`,`help_text` FROM `command`");
+        if (result)
+        {
+            do
+            {
+                Field* fields = result->Fetch();
+                uint32 id = fields[0].GetUInt32();
+                std::string name = fields[1].GetCppString();
+                SetDataForCommandInTable(commandTable, id, name.c_str(), fields[2].GetUInt16(), fields[3].GetCppString());
+            }
+            while (result->NextRow());
+            delete result;
+        }
+    }
+
+    return commandTable;
+}
+
+ChatHandler::ChatHandler(WorldSession* session) : m_session(session) {}
+
+ChatHandler::ChatHandler(Player* player) : m_session(player->GetSession()) {}
+
+ChatHandler::~ChatHandler() {}
+
+/**
+ * @brief Returns a localized MaNGOS string for the current session.
+ *
+ * @param entry The string table entry identifier.
+ * @return const char* The localized string.
+ */
+const char* ChatHandler::GetMangosString(int32 entry) const
+{
+    return m_session->GetMangosString(entry);
+}
+
+/**
+ * @brief Returns the localized on or off label.
+ *
+ * @param value The boolean value to convert.
+ * @return const char* The localized on/off string.
+ */
+const char* ChatHandler::GetOnOffStr(bool value) const
+{
+    return value ?  GetMangosString(LANG_ON) : GetMangosString(LANG_OFF);
+}
+
+/**
+ * @brief Returns the account id associated with this chat handler.
+ *
+ * @return uint32 The current account id.
+ */
+uint32 ChatHandler::GetAccountId() const
+{
+    return m_session->GetAccountId();
+}
+
+/**
+ * @brief Returns the security level of the current session.
+ *
+ * @return AccountTypes The current access level.
+ */
+AccountTypes ChatHandler::GetAccessLevel() const
+{
+    return m_session->GetSecurity();
+}
+
+/**
+ * @brief Checks whether a command is available at the current access level.
+ *
+ * @param cmd The command to test.
+ * @return true if the command is available; otherwise false.
+ */
+bool ChatHandler::isAvailable(ChatCommand const& cmd) const
+{
+    // check security level only for simple  command (without child commands)
+    return GetAccessLevel() >= (AccountTypes)cmd.SecurityLevel;
+}
+
+/**
+ * @brief Builds a clickable name link for the current player.
+ *
+ * @return std::string The formatted player link.
+ */
+std::string ChatHandler::GetNameLink() const
+{
+    return GetNameLink(m_session->GetPlayer());
+}
+
+/**
+ * @brief Checks whether the handler has lower security than a target player or account.
+ *
+ * @param target The online target player, if available.
+ * @param guid The target player GUID when no player pointer is available.
+ * @param strong True to require strictly greater access.
+ * @return true if the handler lacks sufficient security; otherwise false.
+ */
+bool ChatHandler::HasLowerSecurity(Player* target, ObjectGuid guid, bool strong)
+{
+    WorldSession* target_session = NULL;
+    uint32 target_account = 0;
+
+    if (target)
+    {
+        target_session = target->GetSession();
+    }
+    else
+    {
+        target_account = sObjectMgr.GetPlayerAccountIdByGUID(guid);
+    }
+
+    if (!target_session && !target_account)
+    {
+        SendSysMessage(LANG_PLAYER_NOT_FOUND);
+        SetSentErrorMessage(true);
+        return true;
+    }
+
+    return HasLowerSecurityAccount(target_session, target_account, strong);
+}
+
+/**
+ * @brief Checks whether the handler has lower security than a target account or session.
+ *
+ * @param target The online target session, if available.
+ * @param target_account The target account id when no session is available.
+ * @param strong True to require strictly greater access.
+ * @return true if the handler lacks sufficient security; otherwise false.
+ */
+bool ChatHandler::HasLowerSecurityAccount(WorldSession* target, uint32 target_account, bool strong)
+{
+    AccountTypes target_sec;
+
+    // ignore only for non-players for non strong checks (when allow apply command at least to same sec level)
+    if (GetAccessLevel() > SEC_PLAYER && !strong && !sWorld.getConfig(CONFIG_BOOL_GM_LOWER_SECURITY))
+    {
+        return false;
+    }
+
+    if (target)
+    {
+        target_sec = target->GetSecurity();
+    }
+    else if (target_account)
+    {
+        target_sec = sAccountMgr.GetSecurity(target_account);
+    }
+    else
+    {
+        return true;                                         // caller must report error for (target==NULL && target_account==0)
+    }
+
+    if (GetAccessLevel() < target_sec || (strong && GetAccessLevel() <= target_sec))
+    {
+        SendSysMessage(LANG_YOURS_SECURITY_IS_LOW);
+        SetSentErrorMessage(true);
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * @brief Checks whether one string is a valid abbreviation of another.
+ *
+ * @param name The full command name.
+ * @param part The abbreviation to test.
+ * @return true if the abbreviation matches; otherwise false.
+ */
+bool ChatHandler::hasStringAbbr(const char* name, const char* part)
+{
+    // non "" command
+    if (*name)
+    {
+        // "" part from non-"" command
+        if (!*part)
+        {
+            return false;
+        }
+
+        for (;;)
+        {
+            if (!*part)
+            {
+                return true;
+            }
+            else if (!*name)
+            {
+                return false;
+            }
+            else if (tolower(*name) != tolower(*part))
+            {
+                return false;
+            }
+            ++name; ++part;
+        }
+    }
+    // allow with any for ""
+
+    return true;
+}
+
+
+
+
+
+
+
+/**
+ * @brief Validates command table structure and reports inconsistencies.
+ *
+ * @param table The command table to validate.
+ * @param parentCommand The parent command, or NULL for the root table.
+ */
+void ChatHandler::CheckIntegrity(ChatCommand* table, ChatCommand* parentCommand)
+{
+    for (uint32 i = 0; table[i].Name != NULL; ++i)
+    {
+        ChatCommand* command = &table[i];
+
+        if (parentCommand && command->SecurityLevel < parentCommand->SecurityLevel)
+            sLog.outError("Subcommand '%s' of command '%s' have less access level (%u) that parent (%u)",
+                          command->Name, parentCommand->Name, command->SecurityLevel, parentCommand->SecurityLevel);
+
+        if (!parentCommand && strlen(command->Name) == 0)
+        {
+            sLog.outError("Subcommand '' at top level");
+        }
+
+        if (command->ChildCommands)
+        {
+            if (command->Handler)
+            {
+                if (parentCommand)
+                    sLog.outError("Subcommand '%s' of command '%s' have handler and subcommands in same time, must be used '' subcommand for handler instead.",
+                                  command->Name, parentCommand->Name);
+                else
+                    sLog.outError("First level command '%s' have handler and subcommands in same time, must be used '' subcommand for handler instead.",
+                                  command->Name);
+            }
+
+            if (parentCommand && strlen(command->Name) == 0)
+            {
+                sLog.outError("Subcommand '' of command '%s' have subcommands", parentCommand->Name);
+            }
+
+            CheckIntegrity(command->ChildCommands, command);
+        }
+        else if (!command->Handler)
+        {
+            if (parentCommand)
+                sLog.outError("Subcommand '%s' of command '%s' not have handler and subcommands in same time. Must have some from its!",
+                              command->Name, parentCommand->Name);
+            else
+                sLog.outError("First level command '%s' not have handler and subcommands in same time. Must have some from its!",
+                              command->Name);
+        }
+    }
+}
+
+/**
+ * Search (sub)command for command line available for chat handler access level
+ *
+ * @param text  Command line string that will parsed for (sub)command search
+ *
+ * @return Pointer to found command structure or NULL if appropriate command not found
+ */
+ChatCommand const* ChatHandler::FindCommand(char const* text)
+{
+    ChatCommand* command = NULL;
+    char const* textPtr = text;
+
+    return FindCommand(getCommandTable(), textPtr, command) == CHAT_COMMAND_OK ? command : NULL;
+}
+
+/**
+ * Search (sub)command for command line available for chat handler access level with options and fail case additional info
+ *
+ * @param table         Pointer to command C-style array first level command where will be searched
+ * @param text          Command line string that will parsed for (sub)command search,
+ *                      it modified at return from function and pointed to not parsed tail
+ * @param command       At success this is found command, at other cases this is last found parent command
+ *                      before subcommand search fail
+ * @param parentCommand Output arg for optional return parent command for command arg.
+ * @param cmdNamePtr    Output arg for optional return last parsed command name.
+ * @param allAvailable  Optional arg (with false default value) control use command access level checks while command search.
+ * @param exactlyName   Optional arg (with false default value) control use exactly name in checks while command search.
+ *
+ * @return one from enum value of ChatCommandSearchResult. Output args return values highly dependent from this return result:
+ *
+ *      CHAT_COMMAND_OK       - Command found!
+ *                              text point to non parsed tail with possible command specific data, command store found command pointer,
+ *                              parentCommand have parent of found command or NULL if command found in table array directly
+ *                              cmdNamePtr store found command name in original form from command line
+ *      CHAT_COMMAND_UNKNOWN  - Command not found in table directly
+ *                              text only skip possible whitespaces,
+ *                              command is NULL
+ *                              parentCommand is NULL
+ *                              cmdNamePtr store command name that not found as it extracted from command line
+ *      CHAT_COMMAND_UNKNOWN_SUBCOMMAND - Subcommand not found in some deed subcomand lists
+ *                              text point to non parsed tail including not found command name in command line,
+ *                              command store last found parent command if any
+ *                              parentCommand have parent of command in command arg or NULL
+ *                              cmdNamePtr store command name that not found as it extracted from command line
+ */
+ChatCommandSearchResult ChatHandler::FindCommand(ChatCommand* table, char const*& text, ChatCommand*& command, ChatCommand** parentCommand /*= NULL*/, std::string* cmdNamePtr /*= NULL*/, bool allAvailable /*= false*/, bool exactlyName /*= false*/)
+{
+    std::string cmd = "";
+
+    // skip whitespaces
+    while (*text != ' ' && *text != '\0')
+    {
+        cmd += *text;
+        ++text;
+    }
+
+    while (*text == ' ')
+    {
+        ++text;
+    }
+
+    // search first level command in table
+    for (uint32 i = 0; table[i].Name != NULL; ++i)
+    {
+        if (exactlyName)
+        {
+            size_t len = strlen(table[i].Name);
+            if (strncmp(table[i].Name, cmd.c_str(), len + 1) != 0)
+            {
+                continue;
+            }
+        }
+        else
+        {
+            if (!hasStringAbbr(table[i].Name, cmd.c_str()))
+            {
+                continue;
+            }
+        }
+        // select subcommand from child commands list
+        if (table[i].ChildCommands != NULL)
+        {
+            char const* oldchildtext = text;
+            ChatCommand* parentSubcommand = NULL;
+            ChatCommandSearchResult res = FindCommand(table[i].ChildCommands, text, command, &parentSubcommand, cmdNamePtr, allAvailable, exactlyName);
+
+            switch (res)
+            {
+                case CHAT_COMMAND_OK:
+                {
+                    // if subcommand success search not return parent command, then this parent command is owner of child commands
+                    if (parentCommand)
+                    {
+                        *parentCommand = parentSubcommand ? parentSubcommand : &table[i];
+                    }
+
+                    // Name == "" is special case: restore original command text for next level "" (where parentSubcommand==NULL)
+                    if (strlen(command->Name) == 0 && !parentSubcommand)
+                    {
+                        text = oldchildtext;
+                    }
+
+                    return CHAT_COMMAND_OK;
+                }
+                case CHAT_COMMAND_UNKNOWN:
+                {
+                    // command not found directly in child command list, return child command list owner
+                    command = &table[i];
+                    if (parentCommand)
+                    {
+                        *parentCommand = NULL;               // we don't known parent of table list at this point
+                    }
+
+                    text = oldchildtext;                    // restore text to stated just after parse found parent command
+                    return CHAT_COMMAND_UNKNOWN_SUBCOMMAND; // we not found subcommand for table[i]
+                }
+                case CHAT_COMMAND_UNKNOWN_SUBCOMMAND:
+                default:
+                {
+                    // some deep subcommand not found, if this second level subcommand then parentCommand can be NULL, use known value for it
+                    if (parentCommand)
+                    {
+                        *parentCommand = parentSubcommand ? parentSubcommand : &table[i];
+                    }
+                    return res;
+                }
+            }
+        }
+
+        // must be available (not checked for subcommands case because parent command expected have most low access that all subcommands always
+        if (!allAvailable && !isAvailable(table[i]))
+        {
+            continue;
+        }
+
+        // must be have handler is explicitly selected
+        if (!table[i].Handler)
+        {
+            continue;
+        }
+
+        // command found directly in to table
+        command = &table[i];
+
+        // unknown table owner at this point
+        if (parentCommand)
+        {
+            *parentCommand = NULL;
+        }
+
+        if (cmdNamePtr)
+        {
+            *cmdNamePtr = cmd;
+        }
+
+        return CHAT_COMMAND_OK;
+    }
+
+    // command not found in table directly
+    command = NULL;
+
+    // unknown table owner at this point
+    if (parentCommand)
+    {
+        *parentCommand = NULL;
+    }
+
+    if (cmdNamePtr)
+    {
+        *cmdNamePtr = cmd;
+    }
+
+    return CHAT_COMMAND_UNKNOWN;
+}
+
+/**
+ * Execute (sub)command available for chat handler access level with options in command line string
+ *
+ * @param text  Command line string that will parsed for (sub)command search and command specific data
+ *
+ * Command output and errors in command execution will send to chat handler.
+ */
+void ChatHandler::ExecuteCommand(const char* text)
+{
+    std::string fullcmd = text;                             // original `text` can't be used. It content destroyed in command code processing.
+
+    ChatCommand* command = NULL;
+    ChatCommand* parentCommand = NULL;
+
+    ChatCommandSearchResult res = FindCommand(getCommandTable(), text, command, &parentCommand);
+
+    switch (res)
+    {
+        case CHAT_COMMAND_OK:
+        {
+            SetSentErrorMessage(false);
+            if ((this->*(command->Handler))((char*)text))   // text content destroyed at call
+            {
+                if (command->SecurityLevel > SEC_PLAYER)
+                {
+                    LogCommand(fullcmd.c_str());
+                }
+            }
+            // some commands have custom error messages. Don't send the default one in these cases.
+            else if (!HasSentErrorMessage())
+            {
+                if (!command->Help.empty())
+                {
+                    std::string helpText = command->Help;
+
+                    // Attemp to localize help text if not in CLI mode
+                    if (m_session)
+                    {
+                        int loc_idx = m_session->GetSessionDbLocaleIndex();
+                        sCommandMgr.GetCommandHelpLocaleString(command->Id, loc_idx, &helpText);
+                    }
+
+                    SendSysMessage(helpText.c_str());
+                }
+                else
+                {
+                    SendSysMessage(LANG_CMD_SYNTAX);
+                }
+
+                if (ChatCommand* showCommand = (strlen(command->Name) == 0 && parentCommand ? parentCommand : command))
+                {
+                    if (ChatCommand* childs = showCommand->ChildCommands)
+                    {
+                        ShowHelpForSubCommands(childs, showCommand->Name);
+                    }
+                }
+
+                SetSentErrorMessage(true);
+            }
+            break;
+        }
+        case CHAT_COMMAND_UNKNOWN_SUBCOMMAND:
+        {
+#ifdef ENABLE_ELUNA
+            if (Eluna* e = sWorld.GetEluna())
+            {
+                if (!e->OnCommand(m_session ? m_session->GetPlayer() : NULL, fullcmd.c_str()))
+                {
+                    return;
+                }
+            }
+#endif /* ENABLE_ELUNA */
+            SendSysMessage(LANG_NO_SUBCMD);
+            ShowHelpForCommand(command->ChildCommands, text);
+            SetSentErrorMessage(true);
+            break;
+        }
+        case CHAT_COMMAND_UNKNOWN:
+        {
+#ifdef ENABLE_ELUNA
+            if (Eluna* e = sWorld.GetEluna())
+            {
+                if (!e->OnCommand(m_session ? m_session->GetPlayer() : NULL, fullcmd.c_str()))
+                {
+                    return;
+                }
+            }
+#endif /* ENABLE_ELUNA */
+            SendSysMessage(LANG_NO_CMD);
+            SetSentErrorMessage(true);
+            break;
+        }
+    }
+}
+
+/**
+ * Function find appropriate command and update command security level and help text
+ *
+ * @param commandTable  Table for first level command search
+ * @param text          Command line string that will parsed for (sub)command search
+ * @param security      New security level for command
+ * @param help          New help text  for command
+ *
+ * @return true if command has been found, and false in other case
+ *
+ * All problems found while command search and updated output as to DB errors log
+ */
+bool ChatHandler::SetDataForCommandInTable(ChatCommand* commandTable, uint32 id, const char* text, uint32 security, std::string const& help)
+{
+    std::string fullcommand = text;                         // original `text` can't be used. It content destroyed in command code processing.
+
+    ChatCommand* command = NULL;
+    std::string cmdName;
+
+    ChatCommandSearchResult res = FindCommand(commandTable, text, command, NULL, &cmdName, true, true);
+
+    switch (res)
+    {
+        case CHAT_COMMAND_OK:
+        {
+            if (command->SecurityLevel != security)
+                DETAIL_LOG("Table `command` overwrite for command '%s' default security (%u) by %u",
+                           fullcommand.c_str(), command->SecurityLevel, security);
+
+            command->Id = id;
+            command->SecurityLevel = security;
+            command->Help          = help;
+            return true;
+        }
+        case CHAT_COMMAND_UNKNOWN_SUBCOMMAND:
+        {
+            // command have subcommands, but not '' subcommand and then any data in `command` useless for it.
+            if (cmdName.empty())
+            {
+                sLog.outErrorDb("Table `command` have command '%s' that only used with some subcommand selection, it can't have help or overwritten access level, skip.", cmdName.c_str());
+            }
+            else
+            {
+                sLog.outErrorDb("Table `command` have unexpected subcommand '%s' in command '%s', skip.", cmdName.c_str(), fullcommand.c_str());
+            }
+            return false;
+        }
+        case CHAT_COMMAND_UNKNOWN:
+        {
+            sLog.outErrorDb("Table `command` have nonexistent command '%s', skip.", cmdName.c_str());
+            return false;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * @brief Detects and executes a command entered through chat or console input.
+ *
+ * @param text The raw input text.
+ * @return true if the text was treated as a command; otherwise false.
+ */
+bool ChatHandler::ParseCommands(const char* text)
+{
+    MANGOS_ASSERT(text);
+    MANGOS_ASSERT(*text);
+
+    /// chat case (.command or !command format)
+    if (m_session)
+    {
+        if (m_session->GetSecurity() == SEC_PLAYER && !sWorld.getConfig(CONFIG_BOOL_PLAYER_COMMANDS))
+        {
+            return false;
+        }
+
+        if (text[0] != '!' && text[0] != '.')
+        {
+            return false;
+        }
+
+        /// ignore single . and ! in line
+        if (strlen(text) < 2)
+        {
+            return false;
+        }
+    }
+
+    /// ignore messages staring from many dots.
+    if ((text[0] == '.' && text[1] == '.') || (text[0] == '!' && text[1] == '!'))
+    {
+        return false;
+    }
+
+    /// skip first . or ! (in console allowed use command with . and ! and without its)
+    if (text[0] == '!' || text[0] == '.')
+    {
+        ++text;
+    }
+
+    ExecuteCommand(text);
+
+    return true;
+}
+
+
+
+
+/**
+ * @brief Returns the currently selected player, or the session player if nothing is selected.
+ *
+ * @return Player* The selected player, or NULL when no player can be resolved.
+ */
+Player* ChatHandler::getSelectedPlayer()
+{
+    if (!m_session)
+    {
+        uint32 accountId = GetAccountId(); // check for console selection
+        auto itr = m_consoleSelectedPlayers.find(accountId);
+        if (itr != m_consoleSelectedPlayers.end())
+        {
+            return sObjectMgr.GetPlayer(itr->second);
+        }
+        return NULL;
+    }
+
+    ObjectGuid guid  = m_session->GetPlayer()->GetSelectionGuid();
+
+    if (!guid)
+    {
+        return m_session->GetPlayer();
+    }
+
+    return sObjectMgr.GetPlayer(guid);
+}
+
+/**
+ * @brief Returns the currently selected unit, or the session player if nothing is selected.
+ *
+ * @return Unit* The selected unit, or NULL when no unit can be resolved.
+ */
+Unit* ChatHandler::getSelectedUnit()
+{
+    if (!m_session)
+    {
+        uint32 accountId = GetAccountId(); // check for console selection
+        auto itr = m_consoleSelectedPlayers.find(accountId);
+        if (itr != m_consoleSelectedPlayers.end())
+        {
+            return sObjectMgr.GetPlayer(itr->second);
+        }
+        return NULL;
+    }
+
+    ObjectGuid guid = m_session->GetPlayer()->GetSelectionGuid();
+
+    if (!guid)
+    {
+        return m_session->GetPlayer();
+    }
+
+    // can be selected player at another map
+    return ObjectLookup::GetUnit(*m_session->GetPlayer(), guid);
+}
+
+/**
+ * @brief Returns the currently selected creature on the player's map.
+ *
+ * @return Creature* The selected creature, or NULL if selection is not a creature.
+ */
+Creature* ChatHandler::getSelectedCreature()
+{
+    if (!m_session)
+    {
+        return NULL;
+    }
+
+    return m_session->GetPlayer()->GetMap()->GetAnyTypeCreature(m_session->GetPlayer()->GetSelectionGuid());
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+struct RaceMaskName
+{
+    char const* literal;
+    uint32 raceMask;
+};
+
+
+
+/**
+ * @brief Builds a clickable name link for a specific player.
+ *
+ * @param chr The player to represent.
+ * @return std::string The formatted player link.
+ */
+std::string ChatHandler::GetNameLink(Player* chr) const
+{
+    return playerLink(chr->GetName());
+}
+
+/**
+ * @brief Checks whether command output should also be reported to the target player.
+ *
+ * @param chr The target player.
+ * @return true if the target should receive a report; otherwise false.
+ */
+bool ChatHandler::needReportToTarget(Player* chr) const
+{
+    Player* pl = m_session->GetPlayer();
+    return pl != chr && pl->IsVisibleGloballyFor(chr);
+}
+
+/**
+ * @brief Returns the DBC locale used by the current session.
+ *
+ * @return LocaleConstant The session DBC locale.
+ */
+LocaleConstant ChatHandler::GetSessionDbcLocale() const
+{
+    return m_session->GetSessionDbcLocale();
+}
+
+/**
+ * @brief Returns the database locale index used by the current session.
+ *
+ * @return int The session database locale index.
+ */
+int ChatHandler::GetSessionDbLocaleIndex() const
+{
+    return m_session->GetSessionDbLocaleIndex();
+}
+
+/**
+ * @brief Returns a localized MaNGOS string for console output.
+ *
+ * @param entry The string table entry identifier.
+ * @return const char* The localized string.
+ */
+const char* CliHandler::GetMangosString(int32 entry) const
+{
+    return sObjectMgr.GetMangosStringForDBCLocale(entry);
+}
+
+/**
+ * @brief Returns the account id associated with the CLI handler.
+ *
+ * @return uint32 The CLI account id.
+ */
+uint32 CliHandler::GetAccountId() const
+{
+    return m_accountId;
+}
+
+/**
+ * @brief Returns the console login access level.
+ *
+ * @return AccountTypes The CLI access level.
+ */
+AccountTypes CliHandler::GetAccessLevel() const
+{
+    return m_loginAccessLevel;
+}
+
+/**
+ * @brief Checks whether a command is available to the console handler.
+ *
+ * @param cmd The command to test.
+ * @return true if the command can be used from console at the current access level; otherwise false.
+ */
+bool CliHandler::isAvailable(ChatCommand const& cmd) const
+{
+    // skip non-console commands in console case
+    if (!cmd.AllowConsole)
+    {
+        return false;
+    }
+
+    // normal case
+    return GetAccessLevel() >= (AccountTypes)cmd.SecurityLevel;
+}
+
+/**
+ * @brief Sends a system message to the CLI output callback.
+ *
+ * @param str The message text to print.
+ */
+void CliHandler::SendSysMessage(const char* str)
+{
+    m_print(m_callbackArg, str);
+    m_print(m_callbackArg, "\r\n");
+}
+
+/**
+ * @brief Returns the localized console command source label.
+ *
+ * @return std::string The console label.
+ */
+std::string CliHandler::GetNameLink() const
+{
+    return GetMangosString(LANG_CONSOLE_COMMAND);
+}
+
+/**
+ * @brief Indicates that CLI commands always report output to the target context.
+ *
+ * @param chr Unused target player pointer.
+ * @return true Always true for CLI handling.
+ */
+bool CliHandler::needReportToTarget(Player* /*chr*/) const
+{
+    return true;
+}
+
+/**
+ * @brief Returns the default DBC locale used for console output.
+ *
+ * @return LocaleConstant The default DBC locale.
+ */
+LocaleConstant CliHandler::GetSessionDbcLocale() const
+{
+    return sWorld.GetDefaultDbcLocale();
+}
+
+/**
+ * @brief Returns the database locale index used for console output.
+ *
+ * @return int The console database locale index.
+ */
+int CliHandler::GetSessionDbLocaleIndex() const
+{
+    return sObjectMgr.GetDBCLocaleIndex();
+}
+
+// Check/ Output if a NPC or GO (by guid) is part of a pool or game event
+template <typename T>
+
+/**
+ * @brief Reports pool and game event ownership information for a creature or game object spawn.
+ *
+ * @tparam T The spawn type, such as Creature or GameObject.
+ * @param guid The low GUID of the spawn.
+ */
+void ChatHandler::ShowNpcOrGoSpawnInformation(uint32 guid)
+{
+    if (uint16 pool_id = sPoolMgr.IsPartOfAPool<T>(guid))
+    {
+        uint16 top_pool_id = sPoolMgr.IsPartOfTopPool<Pool>(pool_id);
+        if (!top_pool_id || top_pool_id == pool_id)
+        {
+            PSendSysMessage(LANG_NPC_GO_INFO_POOL, pool_id);
+        }
+        else
+        {
+            PSendSysMessage(LANG_NPC_GO_INFO_TOP_POOL, pool_id, top_pool_id);
+        }
+
+        if (int16 event_id = sGameEventMgr.GetGameEventId<Pool>(top_pool_id))
+        {
+            GameEventMgr::GameEventDataMap const& events = sGameEventMgr.GetEventMap();
+            GameEventData const& eventData = events[std::abs(event_id)];
+
+            if (event_id > 0)
+            {
+                PSendSysMessage(LANG_NPC_GO_INFO_POOL_GAME_EVENT_S, top_pool_id, std::abs(event_id), eventData.description.c_str());
+            }
+            else
+            {
+                PSendSysMessage(LANG_NPC_GO_INFO_POOL_GAME_EVENT_D, top_pool_id, std::abs(event_id), eventData.description.c_str());
+            }
+        }
+    }
+    else if (int16 event_id = sGameEventMgr.GetGameEventId<T>(guid))
+    {
+        GameEventMgr::GameEventDataMap const& events = sGameEventMgr.GetEventMap();
+        GameEventData const& eventData = events[std::abs(event_id)];
+
+        if (event_id > 0)
+        {
+            PSendSysMessage(LANG_NPC_GO_INFO_GAME_EVENT_S, std::abs(event_id), eventData.description.c_str());
+        }
+        else
+        {
+            PSendSysMessage(LANG_NPC_GO_INFO_GAME_EVENT_D, std::abs(event_id), eventData.description.c_str());
+        }
+    }
+}
+
+// Prepare ShortString for a NPC or GO (by guid) with pool or game event IDs
+template <typename T>
+
+/**
+ * @brief Builds a short descriptive string about pool or game event ownership for a spawn.
+ *
+ * @tparam T The spawn type, such as Creature or GameObject.
+ * @param guid The low GUID of the spawn.
+ * @return std::string The formatted ownership description, or an empty string.
+ */
+std::string ChatHandler::PrepareStringNpcOrGoSpawnInformation(uint32 guid)
+{
+    std::string str = "";
+    if (uint16 pool_id = sPoolMgr.IsPartOfAPool<T>(guid))
+    {
+        uint16 top_pool_id = sPoolMgr.IsPartOfTopPool<T>(guid);
+        if (int16 event_id = sGameEventMgr.GetGameEventId<Pool>(top_pool_id))
+        {
+            char buffer[100];
+            const char* format = GetMangosString(LANG_NPC_GO_INFO_POOL_EVENT_STRING);
+            sprintf(buffer, format, pool_id, event_id);
+            str = buffer;
+        }
+        else
+        {
+            char buffer[100];
+            const char* format = GetMangosString(LANG_NPC_GO_INFO_POOL_STRING);
+            sprintf(buffer, format, pool_id);
+            str = buffer;
+        }
+    }
+    else if (int16 event_id = sGameEventMgr.GetGameEventId<T>(guid))
+    {
+        char buffer[100];
+        const char* format = GetMangosString(LANG_NPC_GO_INFO_EVENT_STRING);
+        sprintf(buffer, format, event_id);
+        str = buffer;
+    }
+
+    return str;
+}
+
+/**
+ * @brief Logs an executed command together with its execution context.
+ *
+ * @param fullcmd The full command text.
+ */
+void ChatHandler::LogCommand(char const* fullcmd)
+{
+    // chat case
+    if (m_session)
+    {
+        Player* p = m_session->GetPlayer();
+        ObjectGuid sel_guid = p->GetSelectionGuid();
+        sLog.outCommand(GetAccountId(), "Command: %s [Player: %s (Account: %u) X: %f Y: %f Z: %f Map: %u Selected: %s]",
+                        fullcmd, p->GetName(), GetAccountId(), p->Where().X(), p->Where().Y(), p->Where().Z(), p->GetMapId(),
+                        sel_guid.GetString().c_str());
+    }
+    else                                        // 0 account -> console
+    {
+        sLog.outCommand(GetAccountId(), "Command: %s [Account: %u from %s]",
+                        fullcmd, GetAccountId(), GetAccountId() ? "RA-connection" : "Console");
+    }
+}
+
+
+// Shared Helpers between command implementation files
+
+void ChatHandler::ShowFactionListHelper(FactionEntry const* factionEntry, LocaleConstant loc, FactionState const* repState /*= NULL*/, Player* target /*= NULL */)
+{
+    std::string name = factionEntry->Name_lang[loc];
+    // send faction in "id - [faction] rank reputation [visible] [at war] [own team] [unknown] [invisible] [inactive]" format
+    // or              "id - [faction] [no reputation]" format
+    std::ostringstream ss;
+    if (m_session)
+    {
+        ss << factionEntry->ID << " - |cffffffff|Hfaction:" << factionEntry->ID << "|h[" << name << " " << localeNames[loc] << "]|h|r";
+    }
+    else
+    {
+        ss << factionEntry->ID << " - " << name << " " << localeNames[loc];
+    }
+
+    if (repState)                               // and then target!=NULL also
+    {
+        ReputationRank rank = target->GetReputationMgr().GetRank(factionEntry);
+        std::string rankName = GetMangosString(ReputationRankStrIndex[rank]);
+
+        ss << " " << rankName << "|h|r (" << target->GetReputationMgr().GetReputation(factionEntry) << ")";
+
+        if (repState->Flags & FACTION_FLAG_VISIBLE)
+        {
+            ss << GetMangosString(LANG_FACTION_VISIBLE);
+        }
+        if (repState->Flags & FACTION_FLAG_AT_WAR)
+        {
+            ss << GetMangosString(LANG_FACTION_ATWAR);
+        }
+        if (repState->Flags & FACTION_FLAG_PEACE_FORCED)
+        {
+            ss << GetMangosString(LANG_FACTION_PEACE_FORCED);
+        }
+        if (repState->Flags & FACTION_FLAG_HIDDEN)
+        {
+            ss << GetMangosString(LANG_FACTION_HIDDEN);
+        }
+        if (repState->Flags & FACTION_FLAG_INVISIBLE_FORCED)
+        {
+            ss << GetMangosString(LANG_FACTION_INVISIBLE_FORCED);
+        }
+        if (repState->Flags & FACTION_FLAG_INACTIVE)
+        {
+            ss << GetMangosString(LANG_FACTION_INACTIVE);
+        }
+    }
+    else if (target)
+    {
+        ss << GetMangosString(LANG_FACTION_NOREPUTATION);
+    }
+
+    SendSysMessage(ss.str().c_str());
+}
+
+/**
+ * @brief Formats and sends one spell entry line for spell list style commands.
+ *
+ * @param target The target player whose spell state is being inspected.
+ * @param spellInfo The spell definition to display.
+ * @param loc The locale used for spell names.
+ */
+void ChatHandler::ShowSpellListHelper(Player* target, SpellEntry const* spellInfo, LocaleConstant loc)
+{
+    uint32 id = spellInfo->ID;
+
+    bool known = target && target->HasSpell(id);
+    bool learn = (spellInfo->Effect[EFFECT_INDEX_0] == SPELL_EFFECT_LEARN_SPELL);
+
+    uint32 talentCost = GetTalentSpellCost(id);
+
+    bool talent = (talentCost > 0);
+    bool passive = IsPassiveSpell(spellInfo);
+    bool active = target && target->HasAura(id);
+
+    // unit32 used to prevent interpreting uint8 as char at output
+    // find rank of learned spell for learning spell, or talent rank
+    uint32 rank = talentCost ? talentCost : sSpellMgr.GetSpellRank(learn ? spellInfo->EffectTriggerSpell[EFFECT_INDEX_0] : id);
+
+    // send spell in "id - [name, rank N] [talent] [passive] [learn] [known]" format
+    std::ostringstream ss;
+    if (m_session)
+    {
+        ss << id << " - |cffffffff|Hspell:" << id << "|h[" << spellInfo->Name_lang[loc];
+    }
+    else
+    {
+        ss << id << " - " << spellInfo->Name_lang[loc];
+    }
+
+    // include rank in link name
+    if (rank)
+    {
+        ss << GetMangosString(LANG_SPELL_RANK) << rank;
+    }
+
+    if (m_session)
+    {
+        ss << " " << localeNames[loc] << "]|h|r";
+    }
+    else
+    {
+        ss << " " << localeNames[loc];
+    }
+
+    if (talent)
+    {
+        ss << GetMangosString(LANG_TALENT);
+    }
+    if (passive)
+    {
+        ss << GetMangosString(LANG_PASSIVE);
+    }
+    if (learn)
+    {
+        ss << GetMangosString(LANG_LEARN);
+    }
+    if (known)
+    {
+        ss << GetMangosString(LANG_KNOWN);
+    }
+    if (active)
+    {
+        ss << GetMangosString(LANG_ACTIVE);
+    }
+
+    SendSysMessage(ss.str().c_str());
+}
+
+/**
+ * @brief Displays a player list query result in chat or console format.
+ *
+ * @param result The query result containing player rows.
+ * @param limit Optional maximum row count to display.
+ * @param title True to print console table headers.
+ * @param error True to emit an error message when no rows are found.
+ * @return true if any output was produced; otherwise false.
+ */
+bool ChatHandler::ShowPlayerListHelper(QueryResult* result, uint32* limit, bool title, bool error)
+{
+    if (!result)
+    {
+        if (error)
+        {
+            PSendSysMessage(LANG_NO_PLAYERS_FOUND);
+            SetSentErrorMessage(true);
+        }
+        return false;
+    }
+
+    if (!m_session && title)
+    {
+        SendSysMessage(LANG_CHARACTERS_LIST_BAR);
+        SendSysMessage(LANG_CHARACTERS_LIST_HEADER);
+        SendSysMessage(LANG_CHARACTERS_LIST_BAR);
+    }
+
+    if (result)
+    {
+        ///- Circle through them. Display username and GM level
+        do
+        {
+            // check limit
+            if (limit)
+            {
+                if (*limit == 0)
+                {
+                    break;
+                }
+                --* limit;
+            }
+
+            Field* fields = result->Fetch();
+            uint32 guid = fields[0].GetUInt32();
+            std::string name = fields[1].GetCppString();
+            uint8 race = fields[2].GetUInt8();
+            uint8 class_ = fields[3].GetUInt8();
+            uint32 level = fields[4].GetUInt32();
+
+            ChrRacesEntry const* raceEntry = sChrRacesStore.LookupEntry(race);
+            ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(class_);
+
+            char const* race_name = raceEntry ? raceEntry->Name_lang[GetSessionDbcLocale()] : "<?>";
+            char const* class_name = classEntry ? classEntry->Name_lang[GetSessionDbcLocale()] : "<?>";
+
+            if (!m_session)
+            {
+                PSendSysMessage(LANG_CHARACTERS_LIST_LINE_CONSOLE, guid, name.c_str(), race_name, class_name, level);
+            }
+            else
+            {
+                PSendSysMessage(LANG_CHARACTERS_LIST_LINE_CHAT, guid, name.c_str(), name.c_str(), race_name, class_name, level);
+            }
+        } while (result->NextRow());
+
+        delete result;
+    }
+
+    if (!m_session)
+    {
+        SendSysMessage(LANG_CHARACTERS_LIST_BAR);
+    }
+
+    return true;
+}
+
+// Instantiate template for helper function
+template void ChatHandler::ShowNpcOrGoSpawnInformation<Creature>(uint32 guid);
+template void ChatHandler::ShowNpcOrGoSpawnInformation<GameObject>(uint32 guid);
+
+template std::string ChatHandler::PrepareStringNpcOrGoSpawnInformation<Creature>(uint32 guid);
+template std::string ChatHandler::PrepareStringNpcOrGoSpawnInformation<GameObject>(uint32 guid);
+
+/**
+ * @brief Creates and applies all aura effects from a spell entry to a target unit.
+ *
+ * @param spellInfo The spell definition containing aura effects.
+ * @param target The target unit receiving the aura holder.
+ * @param caster The world object treated as the aura caster.
+ * @return true if the aura holder was created and applied; otherwise false.
+ */
+bool AddAuraToPlayer(const SpellEntry* spellInfo, Unit* target, WorldObject* caster)
+{
+    // We assume the spellInfo has been checked and teh spell has aura effects
+    /*
+        if (!IsSpellAppliesAura(spellInfo, (1 << EFFECT_INDEX_0) | (1 << EFFECT_INDEX_1) | (1 << EFFECT_INDEX_2)) &&
+        !spellInfo->HasSpellEffect(SPELL_EFFECT_PERSISTENT_AREA_AURA))
+    */
+    if (!spellInfo)
+    {
+        return false;
+    }
+
+    SpellAuraHolder* holder = CreateSpellAuraHolder(spellInfo, target, caster);
+
+    for (uint32 i = 0; i < MAX_EFFECT_INDEX; ++i)
+    {
+        uint8 eff = spellInfo->Effect[i];
+        if (eff >= TOTAL_SPELL_EFFECTS)
+        {
+            continue;
+        }
+        if (IsAreaAuraEffect(eff) ||
+            eff == SPELL_EFFECT_APPLY_AURA ||
+            eff == SPELL_EFFECT_PERSISTENT_AREA_AURA)
+        {
+            Aura* aur = CreateAura(spellInfo, SpellEffectIndex(i), NULL, holder, target);
+            holder->AddAura(aur, SpellEffectIndex(i));
+        }
+    }
+    target->AddSpellAuraHolder(holder);
+
+    return true;
+}

@@ -1,0 +1,1150 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * MaNGOS is a full featured server for World of Warcraft, supporting
+ * the following clients: 1.12.x, 2.4.3, 3.3.5a, 4.3.4a and 5.4.8
+ *
+ * Copyright (C) 2005-2026 MaNGOS <https://www.getmangos.eu>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * World of Warcraft, and all World of Warcraft or Warcraft art, images,
+ * and lore are copyrighted by Blizzard Entertainment, Inc.
+ */
+
+#include "Utilities/Errors.h"
+#include "Item.h"
+#include "ObjectMgr.h"
+#include "ObjectGuid.h"
+#include "WorldPacket.h"
+#include "Database/DatabaseEnv.h"
+#include "ItemEnchantmentMgr.h"
+#include "SQLStorages.h"
+#ifdef ENABLE_ELUNA
+#include "LuaEngine.h"
+#include <cassert>
+#include <cstring>
+#endif /* ENABLE_ELUNA */
+
+/**
+ * @brief Applies item set bonuses when an item is equipped.
+ *
+ * @param player The player receiving the set bonus.
+ * @param item The item being added.
+ */
+void AddItemsSetItem(Player* player, Item* item)
+{
+    ItemPrototype const* proto = item->GetProto();
+    uint32 setid = proto->ItemSet;
+
+    ItemSetEntry const* set = sItemSetStore.LookupEntry(setid);
+
+    if (!set)
+    {
+        sLog.outErrorDb("Item set %u for item (id %u) not found, mods not applied.", setid, proto->ItemId);
+        return;
+    }
+
+    if (set->RequiredSkill && player->GetSkillValue(set->RequiredSkill) < set->RequiredSkillRank)
+    {
+        return;
+    }
+
+    ItemSetEffect* eff = NULL;
+
+    for (size_t x = 0; x < player->ItemSetEff.size(); ++x)
+    {
+        if (player->ItemSetEff[x] && player->ItemSetEff[x]->setid == setid)
+        {
+            eff = player->ItemSetEff[x];
+            break;
+        }
+    }
+
+    if (!eff)
+    {
+        eff = new ItemSetEffect;
+        memset(eff, 0, sizeof(ItemSetEffect));
+        eff->setid = setid;
+
+        size_t x = 0;
+        for (; x < player->ItemSetEff.size(); ++x)
+        {
+            if (!player->ItemSetEff[x])
+            {
+                break;
+            }
+        }
+
+        if (x < player->ItemSetEff.size())
+        {
+            player->ItemSetEff[x] = eff;
+        }
+        else
+        {
+            player->ItemSetEff.push_back(eff);
+        }
+    }
+
+    ++eff->item_count;
+
+    for (uint32 x = 0; x < 8; ++x)
+    {
+        if (!set->SetSpellID[x])
+        {
+            continue;
+        }
+        // not enough for  spell
+        if (set->SetThreshold[x] > eff->item_count)
+        {
+            continue;
+        }
+
+        uint32 z = 0;
+        for (; z < 8; ++z)
+        {
+            if (eff->spells[z] && eff->spells[z]->ID == set->SetSpellID[x])
+            {
+                break;
+            }
+        }
+
+        if (z < 8)
+        {
+            continue;
+        }
+
+        // new spell
+        for (uint32 y = 0; y < 8; ++y)
+        {
+            if (!eff->spells[y])                            // free slot
+            {
+                SpellEntry const* spellInfo = sSpellStore.LookupEntry(set->SetSpellID[x]);
+                if (!spellInfo)
+                {
+                    sLog.outError("WORLD: unknown spell id %u in items set %u effects", set->SetSpellID[x], setid);
+                    break;
+                }
+
+                // spell casted only if fit form requirement, in other case will casted at form change
+                player->ApplyEquipSpell(spellInfo, NULL, true);
+                eff->spells[y] = spellInfo;
+                break;
+            }
+        }
+    }
+}
+
+/**
+ * @brief Removes item set bonuses when an item is unequipped.
+ *
+ * @param player The player losing the set bonus.
+ * @param proto The item prototype being removed.
+ */
+void RemoveItemsSetItem(Player* player, ItemPrototype const* proto)
+{
+    uint32 setid = proto->ItemSet;
+
+    ItemSetEntry const* set = sItemSetStore.LookupEntry(setid);
+
+    if (!set)
+    {
+        sLog.outErrorDb("Item set #%u for item #%u not found, mods not removed.", setid, proto->ItemId);
+        return;
+    }
+
+    ItemSetEffect* eff = NULL;
+    size_t setindex = 0;
+    for (; setindex < player->ItemSetEff.size(); ++setindex)
+    {
+        if (player->ItemSetEff[setindex] && player->ItemSetEff[setindex]->setid == setid)
+        {
+            eff = player->ItemSetEff[setindex];
+            break;
+        }
+    }
+
+    // can be in case now enough skill requirement for set appling but set has been appliend when skill requirement not enough
+    if (!eff)
+    {
+        return;
+    }
+
+    --eff->item_count;
+
+    for (uint32 x = 0; x < 8; ++x)
+    {
+        if (!set->SetSpellID[x])
+        {
+            continue;
+        }
+
+        // enough for spell
+        if (set->SetThreshold[x] <= eff->item_count)
+        {
+            continue;
+        }
+
+        for (uint32 z = 0; z < 8; ++z)
+        {
+            if (eff->spells[z] && eff->spells[z]->ID == set->SetSpellID[x])
+            {
+                // spell can be not active if not fit form requirement
+                player->ApplyEquipSpell(eff->spells[z], NULL, false);
+                eff->spells[z] = NULL;
+                break;
+            }
+        }
+    }
+
+    if (!eff->item_count)                                   // all items of a set were removed
+    {
+        MANGOS_ASSERT(eff == player->ItemSetEff[setindex]);
+        delete eff;
+        player->ItemSetEff[setindex] = NULL;
+    }
+}
+
+/**
+ * @brief Checks whether an item can be placed into a specific bag type.
+ *
+ * @param pProto The item prototype to place.
+ * @param pBagProto The bag prototype receiving the item.
+ * @return true if the item fits the bag restrictions; otherwise, false.
+ */
+bool ItemCanGoIntoBag(ItemPrototype const* pProto, ItemPrototype const* pBagProto)
+{
+    if (!pProto || !pBagProto)
+    {
+        return false;
+    }
+
+    switch (pBagProto->Class)
+    {
+        case ITEM_CLASS_CONTAINER:
+            switch (pBagProto->SubClass)
+            {
+                case ITEM_SUBCLASS_CONTAINER:
+                    return true;
+                case ITEM_SUBCLASS_SOUL_CONTAINER:
+                    if (pProto->BagFamily != BAG_FAMILY_SOUL_SHARDS)
+                    {
+                        return false;
+                    }
+                    return true;
+                case ITEM_SUBCLASS_HERB_CONTAINER:
+                    if (pProto->BagFamily != BAG_FAMILY_HERBS)
+                    {
+                        return false;
+                    }
+                    return true;
+                case ITEM_SUBCLASS_ENCHANTING_CONTAINER:
+                    if (pProto->BagFamily != BAG_FAMILY_ENCHANTING_SUPP)
+                    {
+                        return false;
+                    }
+                    return true;
+                case ITEM_SUBCLASS_MINING_CONTAINER:
+                    if (pProto->BagFamily != BAG_FAMILY_MINING_SUPP)
+                    {
+                        return false;
+                    }
+                    return true;
+                case ITEM_SUBCLASS_ENGINEERING_CONTAINER:
+                    if (pProto->BagFamily != BAG_FAMILY_ENGINEERING_SUPP)
+                    {
+                        return false;
+                    }
+                    return true;
+                case ITEM_SUBCLASS_GEM_CONTAINER:
+                    if (pProto->BagFamily != BAG_FAMILY_GEMS)
+                    {
+                        return false;
+                    }
+                    return true;
+                case ITEM_SUBCLASS_LEATHERWORKING_CONTAINER:
+                    if (pProto->BagFamily != BAG_FAMILY_LEATHERWORKING_SUPP)
+                    {
+                        return false;
+                    }
+                    return true;
+                default:
+                    return false;
+            }
+        case ITEM_CLASS_QUIVER:
+            switch (pBagProto->SubClass)
+            {
+                case ITEM_SUBCLASS_QUIVER:
+                    if (pProto->BagFamily != BAG_FAMILY_ARROWS)
+                    {
+                        return false;
+                    }
+                    return true;
+                case ITEM_SUBCLASS_AMMO_POUCH:
+                    if (pProto->BagFamily != BAG_FAMILY_BULLETS)
+                    {
+                        return false;
+                    }
+                    return true;
+                default:
+                    return false;
+            }
+    }
+    return false;
+}
+
+/**
+ * @brief Creates an empty item instance.
+ */
+Item::Item() :
+    loot(NULL)
+{
+    m_objectType |= TYPEMASK_ITEM;
+    m_objectTypeId = TYPEID_ITEM;
+    // 2.3.2 - 0x18
+    m_updateFlag = (UPDATEFLAG_LOWGUID | UPDATEFLAG_HIGHGUID);
+
+    m_valuesCount = ITEM_END;
+    m_slot = 0;
+    uState = ITEM_NEW;
+    uQueuePos = -1;
+    m_container = NULL;
+    mb_in_trade = false;
+    m_lootState = ITEM_LOOT_NONE;
+}
+
+/**
+ * @brief Destroys the item instance.
+ */
+Item::~Item()
+{
+}
+
+
+
+
+
+
+
+
+
+/**
+ * @brief Gets the prototype data for this item entry.
+ *
+ * @return The item prototype, or null if unavailable.
+ */
+ItemPrototype const* Item::GetProto() const
+{
+    return ObjectMgr::GetItemPrototype(GetEntry());
+}
+
+/**
+ * @brief Gets the owning player of this item.
+ *
+ * @return The owner player, or null if offline or missing.
+ */
+Player* Item::GetOwner()const
+{
+    return sObjectMgr.GetPlayer(GetOwnerGuid());
+}
+
+/**
+ * @brief Gets the skill associated with using this item.
+ *
+ * @return The skill identifier, or 0 if none applies.
+ */
+uint32 Item::GetSkill()
+{
+    const static uint32 item_weapon_skills[MAX_ITEM_SUBCLASS_WEAPON] =
+    {
+        SKILL_AXES,     SKILL_2H_AXES,  SKILL_BOWS,          SKILL_GUNS,      SKILL_MACES,
+        SKILL_2H_MACES, SKILL_POLEARMS, SKILL_SWORDS,        SKILL_2H_SWORDS, 0,
+        SKILL_STAVES,   0,              0,                   SKILL_UNARMED,   0,
+        SKILL_DAGGERS,  SKILL_THROWN,   SKILL_ASSASSINATION, SKILL_CROSSBOWS, SKILL_WANDS,
+        SKILL_FISHING
+    };
+
+    const static uint32 item_armor_skills[MAX_ITEM_SUBCLASS_ARMOR] =
+    {
+        0, SKILL_CLOTH, SKILL_LEATHER, SKILL_MAIL, SKILL_PLATE_MAIL, 0, SKILL_SHIELD, 0, 0, 0
+    };
+
+    ItemPrototype const* proto = GetProto();
+
+    switch (proto->Class)
+    {
+        case ITEM_CLASS_WEAPON:
+            if (proto->SubClass >= MAX_ITEM_SUBCLASS_WEAPON)
+            {
+                return 0;
+            }
+            else
+            {
+                return item_weapon_skills[proto->SubClass];
+            }
+
+        case ITEM_CLASS_ARMOR:
+            if (proto->SubClass >= MAX_ITEM_SUBCLASS_ARMOR)
+            {
+                return 0;
+            }
+            else
+            {
+                return item_armor_skills[proto->SubClass];
+            }
+
+        default:
+            return 0;
+    }
+}
+
+/**
+ * @brief Gets the spell that teaches the skill for this item type.
+ *
+ * @return The teaching spell identifier, or 0 if none applies.
+ */
+uint32 Item::GetSpell()
+{
+    ItemPrototype const* proto = GetProto();
+
+    switch (proto->Class)
+    {
+        case ITEM_CLASS_WEAPON:
+            switch (proto->SubClass)
+            {
+                case ITEM_SUBCLASS_WEAPON_AXE:     return  196;
+                case ITEM_SUBCLASS_WEAPON_AXE2:    return  197;
+                case ITEM_SUBCLASS_WEAPON_BOW:     return  264;
+                case ITEM_SUBCLASS_WEAPON_GUN:     return  266;
+                case ITEM_SUBCLASS_WEAPON_MACE:    return  198;
+                case ITEM_SUBCLASS_WEAPON_MACE2:   return  199;
+                case ITEM_SUBCLASS_WEAPON_POLEARM: return  200;
+                case ITEM_SUBCLASS_WEAPON_SWORD:   return  201;
+                case ITEM_SUBCLASS_WEAPON_SWORD2:  return  202;
+                case ITEM_SUBCLASS_WEAPON_STAFF:   return  227;
+                case ITEM_SUBCLASS_WEAPON_DAGGER:  return 1180;
+                case ITEM_SUBCLASS_WEAPON_THROWN:  return 2567;
+                case ITEM_SUBCLASS_WEAPON_SPEAR:   return 3386;
+                case ITEM_SUBCLASS_WEAPON_CROSSBOW: return 5011;
+                case ITEM_SUBCLASS_WEAPON_WAND:    return 5009;
+                default: return 0;
+            }
+        case ITEM_CLASS_ARMOR:
+            switch (proto->SubClass)
+            {
+                case ITEM_SUBCLASS_ARMOR_CLOTH:    return 9078;
+                case ITEM_SUBCLASS_ARMOR_LEATHER:  return 9077;
+                case ITEM_SUBCLASS_ARMOR_MAIL:     return 8737;
+                case ITEM_SUBCLASS_ARMOR_PLATE:    return  750;
+                case ITEM_SUBCLASS_ARMOR_SHIELD:   return 9116;
+                default: return 0;
+            }
+    }
+    return 0;
+}
+
+/**
+ * @brief Generates a random property id for an item entry.
+ *
+ * @param item_id The item entry identifier.
+ * @return The generated random property id, or 0 if none applies.
+ */
+int32 Item::GenerateItemRandomPropertyId(uint32 item_id)
+{
+    ItemPrototype const* itemProto = sItemStorage.LookupEntry<ItemPrototype>(item_id);
+
+    if (!itemProto)
+    {
+        return 0;
+    }
+
+    // item must have one from this field values not null if it can have random enchantments
+    if ((!itemProto->RandomProperty) && (!itemProto->RandomSuffix))
+    {
+        return 0;
+    }
+
+    // Random Property case
+    if (itemProto->RandomProperty)
+    {
+        uint32 randomPropId = GetItemEnchantMod(itemProto->RandomProperty);
+        ItemRandomPropertiesEntry const* random_id = sItemRandomPropertiesStore.LookupEntry(randomPropId);
+        if (!random_id)
+        {
+            sLog.outErrorDb("Enchantment id #%u used but it doesn't have records in 'ItemRandomProperties.dbc'", randomPropId);
+            return 0;
+        }
+
+        return random_id->ID;
+    }
+    // Random Suffix case
+    else
+    {
+        uint32 randomPropId = GetItemEnchantMod(itemProto->RandomSuffix);
+        ItemRandomSuffixEntry const* random_id = sItemRandomSuffixStore.LookupEntry(randomPropId);
+        if (!random_id)
+        {
+            sLog.outErrorDb("Enchantment id #%u used but it doesn't have records in sItemRandomSuffixStore.", randomPropId);
+            return 0;
+        }
+
+        return -int32(random_id->ID);
+    }
+}
+
+/**
+ * @brief Applies random property enchantments to the item.
+ *
+ * @param randomPropId The random property identifier.
+ */
+void Item::SetItemRandomProperties(int32 randomPropId)
+{
+    if (!randomPropId)
+    {
+        return;
+    }
+
+    if (randomPropId > 0)
+    {
+        ItemRandomPropertiesEntry const* item_rand = sItemRandomPropertiesStore.LookupEntry(randomPropId);
+        if (item_rand)
+        {
+            if (GetInt32Value(ITEM_FIELD_RANDOM_PROPERTIES_ID) != int32(item_rand->ID))
+            {
+                SetInt32Value(ITEM_FIELD_RANDOM_PROPERTIES_ID, item_rand->ID);
+                SetState(ITEM_CHANGED);
+            }
+            for (uint32 i = PROP_ENCHANTMENT_SLOT_2; i < PROP_ENCHANTMENT_SLOT_2 + 3; ++i)
+            {
+                SetEnchantment(EnchantmentSlot(i), item_rand->Enchantment[i - PROP_ENCHANTMENT_SLOT_2], 0, 0);
+            }
+        }
+    }
+    else
+    {
+        ItemRandomSuffixEntry const* item_rand = sItemRandomSuffixStore.LookupEntry(-randomPropId);
+        if (item_rand)
+        {
+            if (GetInt32Value(ITEM_FIELD_RANDOM_PROPERTIES_ID) != -int32(item_rand->ID) ||
+                    !GetItemSuffixFactor())
+            {
+                SetInt32Value(ITEM_FIELD_RANDOM_PROPERTIES_ID, -int32(item_rand->ID));
+                UpdateItemSuffixFactor();
+                SetState(ITEM_CHANGED);
+            }
+
+            for (uint32 i = PROP_ENCHANTMENT_SLOT_0; i < PROP_ENCHANTMENT_SLOT_0 + 3; ++i)
+            {
+                SetEnchantment(EnchantmentSlot(i), item_rand->Enchantment[i - PROP_ENCHANTMENT_SLOT_0], 0, 0);
+            }
+        }
+    }
+}
+
+bool Item::UpdateItemSuffixFactor()
+{
+    uint32 suffixFactor = GenerateEnchSuffixFactor(GetEntry());
+    if (GetItemSuffixFactor() == suffixFactor)
+    {
+        return false;
+    }
+    SetUInt32Value(ITEM_FIELD_PROPERTY_SEED, suffixFactor);
+    return true;
+}
+
+/**
+ * @brief Sets the item update state and queues it for owner persistence if needed.
+ *
+ * @param state The new update state.
+ * @param forplayer Optional player context for queue management.
+ */
+void Item::SetState(ItemUpdateState state, Player* forplayer)
+{
+    if (uState == ITEM_NEW && state == ITEM_REMOVED)
+    {
+        // pretend the item never existed
+        if (forplayer || GetOwnerGuid())
+        {
+            RemoveFromUpdateQueueOf(forplayer);
+        }
+        delete this;
+        return;
+    }
+
+    if (state != ITEM_UNCHANGED)
+    {
+        // new items must stay in new state until saved
+        if (uState != ITEM_NEW)
+        {
+            uState = state;
+        }
+
+        if (forplayer || GetOwnerGuid())
+        {
+            AddToUpdateQueueOf(forplayer);
+        }
+    }
+    else
+    {
+        // unset in queue
+        // the item must be removed from the queue manually
+        uQueuePos = -1;
+        uState = ITEM_UNCHANGED;
+    }
+}
+
+/**
+ * @brief Adds the item to the owner's update queue.
+ *
+ * @param player Optional owner override.
+ */
+void Item::AddToUpdateQueueOf(Player* player)
+{
+    if (IsInUpdateQueue())
+    {
+        return;
+    }
+
+    if (!player)
+    {
+        player = GetOwner();
+        if (!player)
+        {
+            sLog.outError("Item::AddToUpdateQueueOf - %s current owner (%s) not in world!",
+                          GetGuidStr().c_str(), GetOwnerGuid().GetString().c_str());
+            return;
+        }
+    }
+
+    if (player->GetObjectGuid() != GetOwnerGuid())
+    {
+        sLog.outError("Item::AddToUpdateQueueOf - %s current owner (%s) and inventory owner (%s) don't match!",
+                      GetGuidStr().c_str(), GetOwnerGuid().GetString().c_str(), player->GetGuidStr().c_str());
+        return;
+    }
+
+    if (player->m_itemUpdateQueueBlocked)
+    {
+        return;
+    }
+
+    player->m_itemUpdateQueue.push_back(this);
+    uQueuePos = player->m_itemUpdateQueue.size() - 1;
+}
+
+/**
+ * @brief Removes the item from the owner's update queue.
+ *
+ * @param player Optional owner override.
+ */
+void Item::RemoveFromUpdateQueueOf(Player* player)
+{
+    if (!IsInUpdateQueue())
+    {
+        return;
+    }
+
+    if (!player)
+    {
+        player = GetOwner();
+        if (!player)
+        {
+            sLog.outError("Item::RemoveFromUpdateQueueOf - %s current owner (%s) not in world!",
+                          GetGuidStr().c_str(), GetOwnerGuid().GetString().c_str());
+            return;
+        }
+    }
+
+    if (player->GetObjectGuid() != GetOwnerGuid())
+    {
+        sLog.outError("Item::RemoveFromUpdateQueueOf - %s current owner (%s) and inventory owner (%s) don't match!",
+                      GetGuidStr().c_str(), GetOwnerGuid().GetString().c_str(), player->GetGuidStr().c_str());
+        return;
+    }
+
+    if (player->m_itemUpdateQueueBlocked)
+    {
+        return;
+    }
+
+    player->m_itemUpdateQueue[uQueuePos] = NULL;
+    uQueuePos = -1;
+}
+
+/**
+ * @brief Gets the bag slot containing this item.
+ *
+ * @return The bag slot index, or the backpack slot for top-level items.
+ */
+uint8 Item::GetBagSlot() const
+{
+    return m_container ? m_container->GetSlot() : uint8(INVENTORY_SLOT_BAG_0);
+}
+
+/**
+ * @brief Checks whether the item is equipped.
+ *
+ * @return true if the item occupies an equipment slot; otherwise, false.
+ */
+bool Item::IsEquipped() const
+{
+    return !IsInBag() && m_slot < EQUIPMENT_SLOT_END;
+}
+
+/**
+ * @brief Checks whether the item can currently be traded.
+ *
+ * @return true if the item can be traded; otherwise, false.
+ */
+bool Item::CanBeTraded() const
+{
+    if (IsSoulBound())
+    {
+        return false;
+    }
+    if (IsBag() && (Player::IsBagPos(GetPos()) || !((Bag const*)this)->IsEmpty()))
+    {
+        return false;
+    }
+
+    if (Player* owner = GetOwner())
+    {
+        if (owner->CanUnequipItem(GetPos(), false) !=  EQUIP_ERR_OK)
+        {
+            return false;
+        }
+        if (owner->GetLootGuid() == GetObjectGuid())
+        {
+            return false;
+        }
+    }
+
+    if (HasGeneratedLoot())
+    {
+        return false;
+    }
+
+    if (IsBoundByEnchant())
+    {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Checks whether any enchantment makes the item soulbound.
+ *
+ * @return true if an enchantment binds the item; otherwise, false.
+ */
+bool Item::IsBoundByEnchant() const
+{
+    // Check all enchants for soulbound
+    for (uint32 enchant_slot = PERM_ENCHANTMENT_SLOT; enchant_slot < MAX_ENCHANTMENT_SLOT; ++enchant_slot)
+    {
+        uint32 enchant_id = GetEnchantmentId(EnchantmentSlot(enchant_slot));
+        if (!enchant_id)
+        {
+            continue;
+        }
+
+        SpellItemEnchantmentEntry const* enchantEntry = sSpellItemEnchantmentStore.LookupEntry(enchant_id);
+        if (!enchantEntry)
+        {
+            continue;
+        }
+
+        if (enchantEntry->Flags & ENCHANTMENT_CAN_SOULBOUND)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Checks whether the item satisfies a spell's equipment requirements.
+ *
+ * @param spellInfo The spell being evaluated.
+ * @return true if the item matches the spell requirements; otherwise, false.
+ */
+bool Item::IsFitToSpellRequirements(SpellEntry const* spellInfo) const
+{
+    ItemPrototype const* proto = GetProto();
+
+    if (spellInfo->EquippedItemClass != -1)                 // -1 == any item class
+    {
+        if (spellInfo->EquippedItemClass != int32(proto->Class))
+        {
+            return false;                                    //  wrong item class
+        }
+
+        if (spellInfo->EquippedItemSubclass != 0)       // 0 == any subclass
+        {
+            if ((spellInfo->EquippedItemSubclass & (1 << proto->SubClass)) == 0)
+            {
+                return false;                                // subclass not present in mask
+            }
+        }
+    }
+
+    // Only check for item enchantments (TARGET_FLAG_ITEM), all other spells are either NPC spells
+    // or spells where slot requirements are already handled with AttributesEx3 fields
+    // and special code (Titan's Grip, Windfury Attack). Check clearly not applicable for Lava Lash.
+    if (spellInfo->EquippedItemInvTypes != 0 && (spellInfo->Targets & TARGET_FLAG_ITEM))    // 0 == any inventory type
+    {
+        if ((spellInfo->EquippedItemInvTypes  & (1 << proto->InventoryType)) == 0)
+        {
+            return false;                                    // inventory type not present in mask
+        }
+    }
+
+    return true;
+}
+
+/**
+ * @brief Checks whether a unit is a valid target for using this item.
+ *
+ * @param pUnitTarget The candidate unit target.
+ * @return true if the target matches item target requirements; otherwise, false.
+ */
+bool Item::IsTargetValidForItemUse(Unit* pUnitTarget)
+{
+    ItemRequiredTargetMapBounds bounds = sObjectMgr.GetItemRequiredTargetMapBounds(GetProto()->ItemId);
+
+    if (bounds.first == bounds.second)
+    {
+        return true;
+    }
+
+    if (!pUnitTarget)
+    {
+        return false;
+    }
+
+    for (ItemRequiredTargetMap::const_iterator itr = bounds.first; itr != bounds.second; ++itr)
+    {
+        if (itr->second.IsFitToRequirements(pUnitTarget))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+
+
+
+
+
+/**
+ * @brief Checks whether the item is restricted to a different map or zone.
+ *
+ * @param cur_mapId The current map identifier.
+ * @param cur_zoneId The current zone identifier.
+ * @return true if the item is restricted elsewhere; otherwise, false.
+ */
+bool Item::IsLimitedToAnotherMapOrZone(uint32 cur_mapId, uint32 cur_zoneId) const
+{
+    ItemPrototype const* proto = GetProto();
+    return proto && ((proto->Map && proto->Map != cur_mapId) || (proto->Area && proto->Area != cur_zoneId));
+}
+
+// Though the client has the information in the item's data field,
+// we have to send SMSG_ITEM_TIME_UPDATE to display the remaining
+// time.
+/**
+ * @brief Sends the remaining duration update packet for a timed item.
+ *
+ * @param owner The player receiving the update.
+ */
+void Item::SendTimeUpdate(Player* owner)
+{
+#ifdef ENABLE_PLAYERBOTS
+    if (!owner || !owner->IsInWorld() || owner->GetPlayerbotAI())
+    {
+        return;
+    }
+#endif
+
+    uint32 duration = GetUInt32Value(ITEM_FIELD_DURATION);
+    if (!duration)
+    {
+        return;
+    }
+
+    WorldPacket data(SMSG_ITEM_TIME_UPDATE, (8 + 4));
+    data << ObjectGuid(GetObjectGuid());
+    data << uint32(duration);
+    owner->GetSession()->SendPacket(&data);
+}
+
+/**
+ * @brief Creates a new item or bag instance.
+ *
+ * @param item The item entry identifier.
+ * @param count The desired stack count.
+ * @param player The owning player.
+ * @param randomPropertyId Optional random property override.
+ * @return The created item instance, or null on failure.
+ */
+Item* Item::CreateItem(uint32 item, uint32 count, Player const* player, uint32 randomPropertyId)
+{
+    if (count < 1)
+    {
+        return NULL;                                         // don't create item at zero count
+    }
+
+    if (ItemPrototype const* pProto = ObjectMgr::GetItemPrototype(item))
+    {
+        if (count > pProto->GetMaxStackSize())
+        {
+            count = pProto->GetMaxStackSize();
+        }
+
+        MANGOS_ASSERT(count != 0);                              // count != 0 && pProto->Stackable == 0 but checked at loading already
+
+        Item* pItem = NewItemOrBag(pProto);
+        if (pItem->Create(sObjectMgr.GenerateItemLowGuid(), item, player))
+        {
+            pItem->SetCount(count);
+            if (uint32 randId = randomPropertyId ? randomPropertyId : Item::GenerateItemRandomPropertyId(item))
+            {
+                pItem->SetItemRandomProperties(randId);
+            }
+
+            return pItem;
+        }
+        else
+        {
+            delete pItem;
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief Creates a copy of the item with the requested count.
+ *
+ * @param count The stack count for the clone.
+ * @param player The target owner.
+ * @return The cloned item, or null on failure.
+ */
+Item* Item::CloneItem(uint32 count, Player const* player) const
+{
+    Item* newItem = CreateItem(GetEntry(), count, player, GetItemRandomPropertyId());
+    if (!newItem)
+    {
+        return NULL;
+    }
+
+    newItem->SetGuidValue(ITEM_FIELD_CREATOR,     GetGuidValue(ITEM_FIELD_CREATOR));
+    newItem->SetGuidValue(ITEM_FIELD_GIFTCREATOR, GetGuidValue(ITEM_FIELD_GIFTCREATOR));
+    newItem->SetUInt32Value(ITEM_FIELD_FLAGS,     GetUInt32Value(ITEM_FIELD_FLAGS));
+    newItem->SetUInt32Value(ITEM_FIELD_DURATION,  GetUInt32Value(ITEM_FIELD_DURATION));
+    return newItem;
+}
+
+/**
+ * @brief Checks whether the item is bound to someone other than the given player.
+ *
+ * @param player The player attempting to use the item.
+ * @return true if the item is bound away from that player; otherwise, false.
+ */
+bool Item::IsBindedNotWith(Player const* player) const
+{
+    // own item
+    if (GetOwnerGuid() == player->GetObjectGuid())
+    {
+        return false;
+    }
+
+    // has loot with diff owner
+    if (HasGeneratedLoot())
+    {
+        return true;
+    }
+
+    // not binded item
+    if (!IsSoulBound())
+    {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Adds the item to the map client update list.
+ */
+void Item::AddToClientUpdateList()
+{
+    if (Player* pl = GetOwner())
+    {
+        pl->GetMap()->AddUpdateObject(this);
+    }
+}
+
+/**
+ * @brief Removes the item from the map client update list.
+ */
+void Item::RemoveFromClientUpdateList()
+{
+    if (Player* pl = GetOwner())
+    {
+        pl->GetMap()->RemoveUpdateObject(this);
+    }
+}
+
+/**
+ * @brief Builds update data for players who can observe the item.
+ *
+ * @param update_players The update packet aggregation map.
+ */
+void Item::BuildUpdateData(UpdateDataMapType& update_players)
+{
+    if (Player* pl = GetOwner())
+    {
+        BuildUpdateDataForPlayer(pl, update_players);
+    }
+
+    ClearUpdateMask(false);
+}
+
+/**
+ * @brief Checks whether another stack can receive part of this item type.
+ *
+ * @param proto The prototype of the incoming item stack.
+ * @return The inventory result describing merge eligibility.
+ */
+InventoryResult Item::CanBeMergedPartlyWith(ItemPrototype const* proto) const
+{
+    // check item type
+    if (GetEntry() != proto->ItemId)
+    {
+        return EQUIP_ERR_ITEM_CANT_STACK;
+    }
+
+    // check free space (full stacks can't be target of merge
+    if (GetCount() >= proto->GetMaxStackSize())
+    {
+        return EQUIP_ERR_ITEM_CANT_STACK;
+    }
+
+    // not allow merge looting currently items
+    if (HasGeneratedLoot())
+    {
+        return EQUIP_ERR_ALREADY_LOOTED;
+    }
+
+    return EQUIP_ERR_OK;
+}
+
+/**
+ * @brief Checks whether a unit satisfies the required item-use target rule.
+ *
+ * @param pUnitTarget The candidate target unit.
+ * @return true if the unit meets the stored requirements; otherwise, false.
+ */
+bool ItemRequiredTarget::IsFitToRequirements(Unit* pUnitTarget) const
+{
+    if (pUnitTarget->GetTypeId() != TYPEID_UNIT)
+    {
+        return false;
+    }
+
+    if (pUnitTarget->GetEntry() != m_uiTargetEntry)
+    {
+        return false;
+    }
+
+    switch (m_uiType)
+    {
+        case ITEM_TARGET_TYPE_CREATURE:
+            return pUnitTarget->IsAlive();
+        case ITEM_TARGET_TYPE_DEAD:
+            return !pUnitTarget->IsAlive();
+        default:
+            return false;
+    }
+}
+
+/**
+ * @brief Updates the persisted loot state for the item.
+ *
+ * @param state The new loot update state.
+ */
+void Item::SetLootState(ItemLootUpdateState state)
+{
+    // ITEM_LOOT_NONE -> ITEM_LOOT_TEMPORARY -> ITEM_LOOT_NONE
+    // ITEM_LOOT_NONE -> ITEM_LOOT_NEW -> ITEM_LOOT_NONE
+    // ITEM_LOOT_NONE -> ITEM_LOOT_NEW -> ITEM_LOOT_UNCHANGED [<-> ITEM_LOOT_CHANGED] -> ITEM_LOOT_REMOVED -> ITEM_LOOT_NONE
+    switch (state)
+    {
+        case ITEM_LOOT_NONE:
+        case ITEM_LOOT_NEW:
+            assert(false);                                 // not used in state change calls
+            return;
+        case ITEM_LOOT_TEMPORARY:
+            assert(m_lootState == ITEM_LOOT_NONE);          // called only for not generated yet loot case
+            m_lootState = ITEM_LOOT_TEMPORARY;
+            break;
+        case ITEM_LOOT_CHANGED:
+            // new loot must stay in new state until saved, temporary must stay until remove
+            if (m_lootState != ITEM_LOOT_NEW && m_lootState != ITEM_LOOT_TEMPORARY)
+            {
+                m_lootState = m_lootState == ITEM_LOOT_NONE ? ITEM_LOOT_NEW : state;
+            }
+            break;
+        case ITEM_LOOT_UNCHANGED:
+            // expected that called after DB update or load
+            if (m_lootState == ITEM_LOOT_REMOVED)
+            {
+                m_lootState = ITEM_LOOT_NONE;
+            }
+            // temporary must stay until remove (ignore any changes)
+            else if (m_lootState != ITEM_LOOT_TEMPORARY)
+            {
+                m_lootState = ITEM_LOOT_UNCHANGED;
+            }
+            break;
+        case ITEM_LOOT_REMOVED:
+            // if loot not saved then it existence in past can be just ignored
+            if (m_lootState == ITEM_LOOT_NEW || m_lootState == ITEM_LOOT_TEMPORARY)
+            {
+                m_lootState = ITEM_LOOT_NONE;
+                return;
+            }
+
+            m_lootState = ITEM_LOOT_REMOVED;
+            break;
+    }
+
+    if (m_lootState != ITEM_LOOT_NONE && m_lootState != ITEM_LOOT_UNCHANGED && m_lootState != ITEM_LOOT_TEMPORARY)
+    {
+        SetState(ITEM_CHANGED);
+    }
+}
+
+/**
+ * @brief Gets the bound script identifier for this item entry.
+ *
+ * @return The scripted item id.
+ */
+uint32 Item::GetScriptId() const
+{
+    return sScriptMgr.GetBoundScriptId(SCRIPTED_ITEM, GetEntry());
+}

@@ -1,0 +1,3465 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * MaNGOS is a full featured server for World of Warcraft, supporting
+ * the following clients: 1.12.x, 2.4.3, 3.3.5a, 4.3.4a and 5.4.8
+ *
+ * Copyright (C) 2005-2026 MaNGOS <https://www.getmangos.eu>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * World of Warcraft, and all World of Warcraft or Warcraft art, images,
+ * and lore are copyrighted by Blizzard Entertainment, Inc.
+ */
+
+#include "Utilities/Errors.h"
+#include <algorithm>
+#include "Utilities/MathDefines.h"
+#include "Creature.h"
+#include "LivingWorldAnchorPolicy.h"
+#include "Database/DatabaseEnv.h"
+#include "WorldPacket.h"
+#include "World.h"
+#include "ObjectMgr.h"
+#include "ScriptMgr.h"
+#include "ObjectGuid.h"
+#include "SQLStorages.h"
+#include "SpellMgr.h"
+#include "GossipDef.h"
+#include "Player.h"
+#include "GameEventMgr.h"
+#include "PoolManager.h"
+#include "Opcodes.h"
+#include "Log.h"
+#include "LootMgr.h"
+#include "MapManager.h"
+#include "Transports.h"
+#include "TransportMap.h"
+#include "CreatureAI.h"
+#include "CreatureAISelector.h"
+#include "InstanceData.h"
+#include "MapPersistentStateMgr.h"
+#include "BattleGround/BattleGroundMgr.h"
+#include "OutdoorPvP/OutdoorPvP.h"
+#include "Spell.h"
+#include "Util.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
+#include "CellImpl.h"
+#include "movement/MoveSplineInit.h"
+#include "CreatureLinkingMgr.h"
+#include "DisableMgr.h"
+#ifdef ENABLE_ELUNA
+#include "LuaEngine.h"
+#endif /* ENABLE_ELUNA */
+
+// apply implementation of the singletons
+#include "Policies/Singleton.h"
+#include <ctime>
+#include <sstream>
+#include <string>
+#include <vector>
+#include "PlayerRegistry.h"
+#include "Corpse.h"
+
+
+/**
+ * @brief Finds a trainer spell entry by spell id.
+ *
+ * @param spell_id The spell identifier to look up.
+ * @return The matching trainer spell, or null if not found.
+ */
+TrainerSpell const* TrainerSpellData::Find(uint32 spell_id) const
+{
+    TrainerSpellMap::const_iterator itr = spellList.find(spell_id);
+    if (itr != spellList.end())
+    {
+        return &itr->second;
+    }
+
+    return NULL;
+}
+
+/**
+ * @brief Removes a vendor item by item id.
+ *
+ * @param item_id The item entry to remove.
+ * @return true if an item was removed; otherwise, false.
+ */
+bool VendorItemData::RemoveItem(uint32 item_id)
+{
+    for (VendorItemList::iterator i = m_items.begin(); i != m_items.end(); ++i)
+    {
+        if ((*i)->item == item_id)
+        {
+            m_items.erase(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Finds the slot index of a vendor item.
+ *
+ * @param item_id The item entry to search for.
+ * @return The slot index, or the item count if not found.
+ */
+size_t VendorItemData::FindItemSlot(uint32 item_id) const
+{
+    for (size_t i = 0; i < m_items.size(); ++i)
+    {
+        if (m_items[i]->item == item_id)
+        {
+            return i;
+        }
+    }
+    return m_items.size();
+}
+
+/**
+ * @brief Finds vendor item data by item id.
+ *
+ * @param item_id The item entry to search for.
+ * @return The matching vendor item, or null if not found.
+ */
+VendorItem const* VendorItemData::FindItem(uint32 item_id) const
+{
+    for (VendorItemList::const_iterator i = m_items.begin(); i != m_items.end(); ++i)
+    {
+        // Skip checking for conditions, condition system is powerfull enough to not require additional entries only for the conditions
+        if ((*i)->item == item_id)
+        {
+            return *i;
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief Executes a delayed forced-despawn event.
+ *
+ * @param Unused execution time.
+ * @param Unused update time.
+ * @return Always true after despawning the owner.
+ */
+bool ForcedDespawnDelayEvent::Execute(uint64 /*e_time*/, uint32 /*p_time*/)
+{
+    m_owner.ForcedDespawn();
+    return true;
+}
+
+/**
+ * @brief Selects the final creation point for a creature.
+ *
+ * @param cr The creature being placed.
+ */
+void CreatureCreatePos::SelectFinalPoint(Creature* cr)
+{
+    // no object to be near: the coordinates were given to us outright
+    if (!m_closeObject)
+    {
+        return;
+    }
+
+    // right on top of it -- no floor to look for, so a deck needs no special case here
+    if (m_dist == 0.0f)
+    {
+        m_pos.x = m_closeObject->Where().X();
+        m_pos.y = m_closeObject->Where().Y();
+        m_pos.z = m_closeObject->Where().Z();
+        return;
+    }
+
+    // The summoner is standing on a deck, and its summon belongs on that deck -- which is
+    // the one floor GetClosePoint cannot find. It resolves Z against the WORLD, and the
+    // world beneath a hull is the sea floor: a pet called at the rail would be created a
+    // hundred yards straight down, in the water under the ship. Out of everyone's sight,
+    // too far below the deck to ever be boarded by Transport::UpdateMinions, and gone.
+    //
+    // So the spot is chosen on the vessel's own map, in that map's coordinates, which are
+    // the only coordinates a deck has -- nothing is composed and nothing is converted.
+    if (TransportMap* hull = m_closeObject->GetMap()->AsTransport())
+    {
+        const float distance2d = m_dist + m_closeObject->Where().Extent() +
+                                 cr->Where().Extent();
+
+        if (const auto spot = hull->FreeSpotNear(*m_closeObject, distance2d, m_angle))
+        {
+            m_pos.x = spot->x;
+            m_pos.y = spot->y;
+            m_pos.z = spot->z;
+            return;
+        }
+    }
+
+    ClosePointNear(*m_closeObject, m_pos.x, m_pos.y, m_pos.z, cr->Where().Extent(), m_dist, m_angle);
+}
+
+/**
+ * @brief Relocates a creature to the prepared creation position.
+ *
+ * @param cr The creature to move.
+ * @return true if the new position is valid; otherwise, false.
+ */
+bool CreatureCreatePos::PlaceOn(Creature* cr) const
+{
+    cr->Place().MoveTo(m_pos.x, m_pos.y, m_pos.z, m_pos.o);
+
+    // The create block the client receives is written from the movement state, not from
+    // the placement. Leave it empty and every creature that never moves is drawn at the
+    // map origin -- which is why only the ones walking a waypoint path looked right: their
+    // first SMSG_MONSTER_MOVE carried real coordinates and corrected the lie.
+    cr->m_movementInfo.ChangePosition(m_pos.x, m_pos.y, m_pos.z, m_pos.o);
+
+    if (!IsPlaceable(*cr))
+    {
+        sLog.outError("%s not created. Suggested coordinates isn't valid (X: %f Y: %f)", cr->GetGuidStr().c_str(), cr->Where().X(), cr->Where().Y());
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Creates a creature instance with default runtime state.
+ *
+ * @param subtype The creature subtype.
+ */
+Creature::Creature(CreatureSubtype subtype) : Unit(),
+    i_AI(NULL),
+    loot(this),
+    lootForPickPocketed(false), lootForBody(false), lootForSkin(false),
+    m_groupLootTimer(0), m_groupLootId(0),
+    m_lootMoney(0), m_lootGroupRecipientId(0),
+    m_corpseRemoveTime(0), m_respawnTime(0), m_respawnDelay(25), m_corpseDelay(60), m_aggroDelay(0), m_respawnradius(5.0f),
+    m_subtype(subtype), m_defaultMovementType(IDLE_MOTION_TYPE), m_equipmentId(0),
+    m_PlayerDamageReq(0),
+    m_AlreadyCallAssistance(false), m_AlreadySearchedAssistance(false),
+    m_AI_locked(false), m_IsDeadByDefault(false), m_temporaryFactionFlags(TEMPFACTION_NONE),
+    m_meleeDamageSchoolMask(SPELL_SCHOOL_MASK_NORMAL), m_originalEntry(0),
+    m_creatureInfo(NULL)
+{
+    /* Loot data */
+    hasBeenLootedOnce = false;
+    assignedLooter = 0;
+
+    m_killedTime = 0;
+    m_regenTimer = 200;
+    m_valuesCount = UNIT_END;
+
+    // Zero sentinel: lets waypoint evade tell "combat start never recorded"
+    // apart from a real recorded position (set in Unit::Attack), so it can
+    // resume from the departure point instead of the last reached waypoint.
+    m_combatStart = Geometry::Vector3();
+
+    for (int i = 0; i < CREATURE_MAX_SPELLS; ++i)
+    {
+        m_spells[i] = 0;
+    }
+
+    m_CreatureSpellCooldowns.clear();
+    m_CreatureCategoryCooldowns.clear();
+    DisableReputationGain = false;
+
+    SetWalk(true, true);
+}
+
+/**
+ * @brief Destroys the creature and releases owned resources.
+ */
+Creature::~Creature()
+{
+    CleanupsBeforeDelete();
+
+    m_vendorItemCounts.clear();
+
+    delete i_AI;
+    i_AI = NULL;
+}
+
+/**
+ * @brief Adds the creature to the world and object store.
+ */
+void Creature::AddToWorld()
+{
+#ifdef ENABLE_ELUNA
+    bool inWorld = IsInWorld();
+#endif /* ENABLE_ELUNA */
+
+    ///- Register the creature for guid lookup
+    if (!IsInWorld() && GetObjectGuid().IsCreature())
+    {
+        GetMap()->GetObjectsStore().insert<Creature>(GetObjectGuid(), (Creature*)this);
+    }
+
+    Unit::AddToWorld();
+
+    // Index it on the vessel whose deck this map is. NOT a registration -- being aboard is
+    // what having this map MEANS, and every consumer derives it. This list exists only so
+    // the seam can hand out destroy blocks in the right order.
+    if (TransportMap* hull = GetMap()->AsTransport())
+    {
+        hull->EnlistCrew(this);
+    }
+
+    // Make active if required
+    if (sWorld.isForceLoadMap(GetMapId()) ||
+        (GetCreatureInfo()->ExtraFlags & CREATURE_FLAG_EXTRA_ACTIVE) ||
+        IsLivingWorldAnchor(GetCreatureInfo(), sMapStore.LookupEntry(GetMapId()),
+                            sWorld.getConfig(CONFIG_UINT32_LIVINGWORLD_ANCHOR_MASK)) ||
+        (GetLivingWorldDefenderCategory(GetCreatureInfo(), sMapStore.LookupEntry(GetMapId()),
+                                        GetDefaultMovementType() == WAYPOINT_MOTION_TYPE)
+            & sWorld.getConfig(CONFIG_UINT32_LIVINGWORLD_ANCHOR_MASK)))
+    {
+        SetActiveObjectState(true);
+    }
+
+#ifdef ENABLE_ELUNA
+    if (!inWorld)
+    {
+        if (Eluna* e = GetEluna())
+        {
+            e->OnAddToWorld(this);
+        }
+    }
+#endif /* ENABLE_ELUNA */
+
+}
+
+/**
+ * @brief Removes the creature from the world and object store.
+ */
+void Creature::RemoveFromWorld()
+{
+    // Off the vessel's crew index. NOT an unboarding -- being aboard is what having this
+    // map MEANS -- but the index holds a raw pointer and must not outlive the creature.
+    if (IsInWorld() && GetMap())
+    {
+        if (TransportMap* hull = GetMap()->AsTransport())
+        {
+            hull->DelistCrew(this);
+        }
+    }
+
+#ifdef ENABLE_ELUNA
+    if (IsInWorld())
+    {
+        if (Eluna* e = GetEluna())
+        {
+            e->OnRemoveFromWorld(this);
+        }
+    }
+#endif /* ENABLE_ELUNA */
+
+    ///- Remove the creature from the accessor
+    if (IsInWorld() && GetObjectGuid().IsCreature())
+    {
+        GetMap()->GetObjectsStore().erase<Creature>(GetObjectGuid(), (Creature*)NULL);
+    }
+
+    Unit::RemoveFromWorld();
+}
+
+/**
+ * @brief Final cleanup before the creature is deleted.
+ *
+ * This -- not RemoveFromWorld -- is the path a dying or dismissed PET takes: Pet::Unsummon
+ * queues the pet on the map's remove list, and Map::RemoveAllObjectsInRemoveList reaps it
+ * through Map::Remove(true), which calls CleanupsBeforeDelete and then deletes. A boarded pet
+ * must leave its vessel HERE, before it is freed, or the ship keeps a dangling pointer to it
+ * in its passenger list. (The GridReference auto-unlinks from the vessel's container when the
+ * creature is destroyed, but the passenger list is a plain map and does not.) Idempotent, so
+ * it is safe alongside the RemoveFromWorld hook and the vessel's own explicit unboards.
+ */
+void Creature::CleanupsBeforeDelete()
+{
+    if (Map* on = FindMap())
+    {
+        if (TransportMap* hull = on->AsTransport())
+        {
+            hull->DelistCrew(this);
+        }
+    }
+
+    Unit::CleanupsBeforeDelete();
+}
+
+/**
+ * @brief Removes the creature corpse and schedules respawn handling.
+ *
+ * @param inPlace true to leave the corpse in place while removing loot state.
+ */
+void Creature::RemoveCorpse(bool inPlace)
+{
+    if (!inPlace)
+    {
+        // since pool system can fail to roll unspawned object, this one can remain spawned, so must set respawn nevertheless
+        if (uint16 poolid = sPoolMgr.IsPartOfAPool<Creature>(GetGUIDLow()))
+        {
+            sPoolMgr.UpdatePool<Creature>(*GetMap()->GetPersistentState(), poolid, GetGUIDLow());
+        }
+        if (!IsInWorld())                            // can be despawned by update pool
+        {
+            return;
+        }
+    }
+
+    if ((GetDeathState() != CORPSE && !m_IsDeadByDefault) || (GetDeathState() != ALIVE && m_IsDeadByDefault))
+    {
+        return;
+    }
+
+    DEBUG_FILTER_LOG(LOG_FILTER_AI_AND_MOVEGENSS, "Removing corpse of %s ", GetGuidStr().c_str());
+
+    m_corpseRemoveTime = time(NULL);
+    SetDeathState(DEAD);
+    UpdateObjectVisibility();
+
+    // stop loot rolling before loot clear and for close client dialogs
+    StopGroupLoot();
+
+    loot.clear();
+
+    /* Loot data */
+    m_killedTime = 0;
+    hasBeenLootedOnce = false;
+    assignedLooter = 0;
+    m_lootGroupRecipientId = 0;
+    m_lootRecipientGuid.Clear();
+
+    RemoveFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_TAPPED);
+
+    uint32 respawnDelay = 0;
+
+    if (AI())
+    {
+        AI()->CorpseRemoved(respawnDelay);
+    }
+
+    if (m_isCreatureLinkingTrigger)
+    {
+        GetMap()->GetCreatureLinkingHolder()->DoCreatureLinkingEvent(LINKING_EVENT_DESPAWN, this);
+    }
+
+    if (InstanceData* mapInstance = GetInstanceData())
+    {
+        mapInstance->OnCreatureDespawn(this);
+    }
+
+    // script can set time (in seconds) explicit, override the original
+    if (respawnDelay)
+    {
+        m_respawnTime = time(NULL) + respawnDelay;
+    }
+
+    RelocateToRespawnPoint();
+
+    // forced recreate creature object at clients
+    UnitVisibility currentVis = GetVisibility();
+    SetVisibility(VISIBILITY_REMOVE_CORPSE);
+    UpdateObjectVisibility();
+    SetVisibility(currentVis);                              // restore visibility state
+    UpdateObjectVisibility();
+}
+
+/**
+ * change the entry of creature until respawn
+ */
+/**
+ * @brief Initializes creature template-dependent data for the current entry.
+ *
+ * @param Entry The creature entry to apply.
+ * @param team Optional team override.
+ * @param data Optional static spawn data.
+ * @param eventData Optional active event override data.
+ * @return true if initialization succeeded; otherwise, false.
+ */
+bool Creature::InitEntry(uint32 Entry, CreatureData const* data /*=NULL*/, GameEventCreatureData const* eventData /*=NULL*/)
+{
+    // use game event entry if any instead default suggested
+    if (eventData && eventData->entry_id)
+    {
+        Entry = eventData->entry_id;
+    }
+
+    CreatureInfo const* normalInfo = ObjectMgr::GetCreatureTemplate(Entry);
+    if (!normalInfo)
+    {
+        sLog.outErrorDb("Creature::UpdateEntry creature entry %u does not exist.", Entry);
+        return false;
+    }
+
+    // difficulties for dungeons/battleground ordered in normal way
+    // and if more high version not exist must be used lesser version
+    CreatureInfo const* cinfo = normalInfo;
+    if (normalInfo->HeroicEntry)
+    {
+        // we already have valid Map pointer for current creature!
+        if (!GetMap()->IsRegularDifficulty())
+        {
+            cinfo = ObjectMgr::GetCreatureTemplate(normalInfo->HeroicEntry);
+            if (!cinfo)
+            {
+                sLog.outErrorDb("Creature::UpdateEntry creature heroic entry %u does not exist.", normalInfo->HeroicEntry);
+                return false;
+            }
+        }
+    }
+
+    SetEntry(Entry);                                        // normal entry always
+    m_creatureInfo = cinfo;                                 // map mode related always
+
+    SetObjectScale(cinfo->Scale);
+
+    // equal to player Race field, but creature does not have race
+    SetByteValue(UNIT_FIELD_BYTES_0, 0, 0);
+
+    // known valid are: CLASS_WARRIOR,CLASS_PALADIN,CLASS_ROGUE,CLASS_MAGE
+    SetByteValue(UNIT_FIELD_BYTES_0, 1, uint8(cinfo->UnitClass));
+
+    uint32 display_id = ChooseDisplayId(GetCreatureInfo(), data, eventData);
+    if (!display_id)                                        // Cancel load if no display id
+    {
+        sLog.outErrorDb("Creature (Entry: %u) has no model defined in table `creature_template`, can't load.", Entry);
+        return false;
+    }
+
+    CreatureModelInfo const* minfo = sObjectMgr.GetCreatureModelRandomGender(display_id);
+    if (!minfo)                                             // Cancel load if no model defined
+    {
+        sLog.outErrorDb("Creature (Entry: %u) has no model info defined in table `creature_model_info`, can't load.", Entry);
+        return false;
+    }
+
+    display_id = minfo->modelid;                            // it can be different (for another gender)
+
+    SetNativeDisplayId(display_id);
+
+    // normally the same as native, but some has exceptions (Spell::DoSummonTotem)
+    SetDisplayId(display_id);
+
+    SetByteValue(UNIT_FIELD_BYTES_0, 2, minfo->gender);
+
+    // set PowerType based on unit class
+    switch (cinfo->UnitClass)
+    {
+        case CLASS_WARRIOR:
+            SetByteValue(UNIT_FIELD_BYTES_0, 3, POWER_RAGE);
+            break;
+        case CLASS_PALADIN:
+        case CLASS_MAGE:
+            SetByteValue(UNIT_FIELD_BYTES_0, 3, POWER_MANA);
+            break;
+        case CLASS_ROGUE:
+            SetByteValue(UNIT_FIELD_BYTES_0, 3, POWER_ENERGY);
+            break;
+        default:
+            sLog.outErrorDb("Creature (Entry: %u) has unhandled unit class. Power type will not be set!", Entry);
+            break;
+    }
+
+    // Load creature equipment
+    if (eventData && eventData->equipment_id)
+    {
+        LoadEquipment(eventData->equipment_id);             // use event equipment if any for active event
+    }
+    else if (!data || data->equipmentId == 0)
+    {
+        if (cinfo->EquipmentTemplateId== 0)
+        {
+            LoadEquipment(normalInfo->EquipmentTemplateId); // use default from normal template if diff does not have any
+        }
+        else
+        {
+            LoadEquipment(cinfo->EquipmentTemplateId);      // else use from diff template
+        }
+    }
+    else if (data && data->equipmentId != -1)
+    {
+        // override, -1 means no equipment
+        LoadEquipment(data->equipmentId);
+    }
+
+    SetName(normalInfo->Name);                              // at normal entry always
+
+    SetFloatValue(UNIT_MOD_CAST_SPEED, 1.0f);
+
+    // update speed for the new CreatureInfo base speed mods
+    UpdateSpeed(MOVE_WALK, false);
+    UpdateSpeed(MOVE_RUN,  false);
+
+    SetLevitate(cinfo->InhabitType & INHABIT_AIR); // TODO: may not be correct to send opcode at this point (already handled by UPDATE_OBJECT createObject)
+
+    // check if we need to add swimming movement. TODO: i thing movement flags should be computed automatically at each movement of creature so we need a sort of UpdateMovementFlags() method
+    if (cinfo->InhabitType & INHABIT_WATER &&                                   // check inhabit type water
+        data &&                                                                 // check if there is data to get creature spawn pos
+            GetMap()->GetTerrain()->IsInWater(data->posX, data->posY, data->posZ))  // check if creature is in water
+        m_movementInfo.AddMovementFlag(MOVEFLAG_SWIMMING);                      // add swimming movement
+
+    // checked at loading
+    m_defaultMovementType = MovementGeneratorType(cinfo->MovementType);
+
+    return true;
+}
+
+/**
+ * @brief Updates the creature to a new entry while preserving runtime state when possible.
+ *
+ * @param Entry The creature entry to apply.
+ * @param team Optional team override.
+ * @param data Optional static spawn data.
+ * @param eventData Optional active event override data.
+ * @param preserveHPAndPower true to preserve the current health percentage.
+ * @return true if the update succeeded; otherwise, false.
+ */
+bool Creature::UpdateEntry(uint32 Entry, Team team, const CreatureData* data /*=NULL*/, GameEventCreatureData const* eventData /*=NULL*/, bool preserveHPAndPower /*=true*/)
+{
+    if (!InitEntry(Entry, data, eventData))
+    {
+        return false;
+    }
+
+    // creatures always have melee weapon ready if any
+    SetSheath(SHEATH_STATE_MELEE);
+    SetByteValue(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_AURAS);
+
+    if (preserveHPAndPower)
+    {
+        uint32 healthPercent = GetHealthPercent();
+        SelectLevel();
+        SetHealthPercent(healthPercent);
+    }
+    else
+    {
+        SelectLevel();
+    }
+
+    if (team == HORDE)
+    {
+        setFaction(GetCreatureInfo()->FactionHorde);
+    }
+    else
+    {
+        setFaction(GetCreatureInfo()->FactionAlliance);
+    }
+
+    SetUInt32Value(UNIT_NPC_FLAGS, GetCreatureInfo()->NpcFlags);
+
+    uint32 attackTimer = GetCreatureInfo()->MeleeBaseAttackTime;
+
+    SetAttackTime(BASE_ATTACK, attackTimer);
+    SetAttackTime(OFF_ATTACK, attackTimer - attackTimer / 4);
+    SetAttackTime(RANGED_ATTACK, GetCreatureInfo()->RangedBaseAttackTime);
+
+    uint32 unitFlags = GetCreatureInfo()->UnitFlags;
+
+    // we may need to append or remove additional flags
+    if (HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IN_COMBAT))
+    {
+        unitFlags |= UNIT_FLAG_IN_COMBAT;
+    }
+
+    SetUInt32Value(UNIT_FIELD_FLAGS, unitFlags);
+
+    // preserve all current dynamic flags if exist
+    uint32 dynFlags = GetUInt32Value(UNIT_DYNAMIC_FLAGS);
+    SetUInt32Value(UNIT_DYNAMIC_FLAGS, dynFlags ? dynFlags : GetCreatureInfo()->DynamicFlags);
+
+    SetModifierValue(UNIT_MOD_ARMOR, BASE_VALUE, float(GetCreatureInfo()->Armor));
+    SetModifierValue(UNIT_MOD_RESISTANCE_HOLY, BASE_VALUE, float(GetCreatureInfo()->ResistanceHoly));
+    SetModifierValue(UNIT_MOD_RESISTANCE_FIRE, BASE_VALUE, float(GetCreatureInfo()->ResistanceFire));
+    SetModifierValue(UNIT_MOD_RESISTANCE_NATURE, BASE_VALUE, float(GetCreatureInfo()->ResistanceNature));
+    SetModifierValue(UNIT_MOD_RESISTANCE_FROST, BASE_VALUE, float(GetCreatureInfo()->ResistanceFrost));
+    SetModifierValue(UNIT_MOD_RESISTANCE_SHADOW, BASE_VALUE, float(GetCreatureInfo()->ResistanceShadow));
+    SetModifierValue(UNIT_MOD_RESISTANCE_ARCANE, BASE_VALUE, float(GetCreatureInfo()->ResistanceArcane));
+
+    SetCanModifyStats(true);
+    UpdateAllStats();
+
+    // checked and error show at loading templates
+    if (FactionTemplateEntry const* factionTemplate = sFactionTemplateStore.LookupEntry(GetCreatureInfo()->FactionAlliance))
+    {
+        if (factionTemplate->factionFlags & FACTION_TEMPLATE_FLAG_PVP)
+        {
+            SetPvP(true);
+        }
+        else
+        {
+            {
+                SetPvP(false);
+            }
+        }
+    }
+
+    // Try difficulty dependend version before falling back to base entry
+    CreatureTemplateSpells const* templateSpells = sCreatureTemplateSpellsStorage.LookupEntry<CreatureTemplateSpells>(GetCreatureInfo()->Entry);
+    if (!templateSpells)
+    {
+        templateSpells = sCreatureTemplateSpellsStorage.LookupEntry<CreatureTemplateSpells>(GetEntry());
+    }
+    if (templateSpells)
+        for (int i = 0; i < CREATURE_MAX_SPELLS; ++i)
+        {
+            m_spells[i] = templateSpells->spells[i];
+        }
+
+    // if eventData set then event active and need apply spell_start
+    if (eventData)
+    {
+        ApplyGameEventSpells(eventData, true);
+    }
+
+    return true;
+}
+
+/**
+ * @brief Chooses a display model id for the creature.
+ *
+ * @param cinfo The base creature template.
+ * @param data Optional static spawn overrides.
+ * @param eventData Optional active event overrides.
+ * @return The selected display id.
+ */
+uint32 Creature::ChooseDisplayId(const CreatureInfo* cinfo, const CreatureData* data /*= NULL*/, GameEventCreatureData const* eventData /*=NULL*/)
+{
+    // Use creature event model explicit, override any other static models
+    if (eventData && eventData->modelid)
+    {
+        return eventData->modelid;
+    }
+
+    // Use creature model explicit, override template (creature.modelid)
+    if (data && data->modelid_override)
+    {
+        return data->modelid_override;
+    }
+
+    // use defaults from the template
+    uint32 display_id = 0;
+
+    // models may be categorized as (in this order):
+    // if mod4 && mod3 && mod2 && mod1  use any, by 25%-chance (other gender is selected and replaced after this function)
+    // if mod3 && mod2 && mod1          use mod3 unless mod2 has modelid_alt_model (then all by 33%-chance)
+    // if mod2                          use mod2 unless mod2 has modelid_alt_model (then both by 50%-chance)
+    // if mod1                          use mod1
+
+    // model selected here may be replaced with other_gender using own function
+
+    if (cinfo->ModelId[3] && cinfo->ModelId[2] && cinfo->ModelId[1] && cinfo->ModelId[0])
+    {
+        display_id = cinfo->ModelId[urand(0, 3)];
+    }
+    else if (cinfo->ModelId[2] && cinfo->ModelId[1] && cinfo->ModelId[0])
+    {
+        uint32 modelid_tmp = sObjectMgr.GetCreatureModelAlternativeModel(cinfo->ModelId[1]);
+        display_id = modelid_tmp ? cinfo->ModelId[urand(0, 2)] : cinfo->ModelId[2];
+    }
+    else if (cinfo->ModelId[1])
+    {
+        // We use this to eliminate invisible models vs. "dummy" models (infernals, etc).
+        // Where it's expected to select one of two, model must have a alternative model defined (alternative model is normally the same as defined in ModelId1).
+        // Same pattern is used in the above model selection, but the result may be ModelId3 and not ModelId2 as here.
+        uint32 modelid_tmp = sObjectMgr.GetCreatureModelAlternativeModel(cinfo->ModelId[1]);
+        display_id = modelid_tmp ? cinfo->ModelId[urand(0, 1)] : cinfo->ModelId[1];
+    }
+    else if (cinfo->ModelId[0])
+    {
+        display_id = cinfo->ModelId[0];
+    }
+
+    // fail safe, we use creature entry 1 and make error
+    if (!display_id)
+    {
+        sLog.outErrorDb("Call customer support, ChooseDisplayId can not select native model for creature entry %u, model from creature entry 1 will be used instead.", cinfo->Entry);
+
+        if (const CreatureInfo* creatureDefault = ObjectMgr::GetCreatureTemplate(1))
+        {
+            display_id = creatureDefault->ModelId[0];
+        }
+    }
+
+    return display_id;
+}
+
+/**
+ * @brief Updates creature state, AI, regeneration, corpse handling, and respawn logic.
+ *
+ * @param update_diff The elapsed regeneration/update time in milliseconds.
+ * @param diff The elapsed AI update time in milliseconds.
+ */
+void Creature::Update(uint32 update_diff, uint32 diff)
+{
+    switch (m_deathState)
+    {
+        case JUST_ALIVED:
+            // Don't must be called, see Creature::SetDeathState JUST_ALIVED -> ALIVE promoting.
+            sLog.outError("Creature (GUIDLow: %u Entry: %u ) in wrong state: JUST_ALIVED (4)", GetGUIDLow(), GetEntry());
+            break;
+        case JUST_DIED:
+            // Don't must be called, see Creature::SetDeathState JUST_DIED -> CORPSE promoting.
+            sLog.outError("Creature (GUIDLow: %u Entry: %u ) in wrong state: JUST_DEAD (1)", GetGUIDLow(), GetEntry());
+            break;
+        case DEAD:
+        {
+            if (m_respawnTime <= time(NULL) && (!m_isSpawningLinked || GetMap()->GetCreatureLinkingHolder()->CanSpawn(this)))
+            {
+                DEBUG_FILTER_LOG(LOG_FILTER_AI_AND_MOVEGENSS, "Respawning...");
+                m_respawnTime = 0;
+                m_aggroDelay = sWorld.getConfig(CONFIG_UINT32_CREATURE_RESPAWN_AGGRO_DELAY);
+                lootForPickPocketed = false;
+                lootForBody         = false;
+                lootForSkin         = false;
+
+                // Clear possible auras having IsDeathPersistent() attribute
+                RemoveAllAuras();
+
+                if (m_originalEntry != GetEntry())
+                {
+                    // need preserver gameevent state
+                    GameEventCreatureData const* eventData = sGameEventMgr.GetCreatureUpdateDataForActiveEvent(GetGUIDLow());
+                    UpdateEntry(m_originalEntry, TEAM_NONE, NULL, eventData);
+                }
+
+                SelectLevel();
+                UpdateAllStats();  // to be sure stats is correct regarding level of the creature
+                SetUInt32Value(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_NONE);
+                if (m_IsDeadByDefault)
+                {
+                    SetDeathState(JUST_DIED);
+                    SetHealth(0);
+                    i_motionMaster.Clear();
+                    clearUnitState(UNIT_STAT_ALL_STATE);
+                    LoadCreatureAddon(true);
+                }
+                else
+                {
+                    SetDeathState(JUST_ALIVED);
+                }
+
+                // Call AI respawn virtual function
+                if (AI())
+                {
+                    AI()->JustRespawned();
+                }
+
+                if (m_isCreatureLinkingTrigger)
+                {
+                    GetMap()->GetCreatureLinkingHolder()->DoCreatureLinkingEvent(LINKING_EVENT_RESPAWN, this);
+                }
+
+                GetMap()->Add(this);
+            }
+            break;
+        }
+        case CORPSE:
+        {
+            Unit::Update(update_diff, diff);
+
+            if (m_IsDeadByDefault)
+            {
+                break;
+            }
+
+            if (m_groupLootId)                              // Loot is stopped already if corpse got removed.
+            {
+                if (m_groupLootTimer <= update_diff)
+                {
+                    StopGroupLoot();
+                }
+                else
+                {
+                    m_groupLootTimer -= update_diff;
+                }
+            }
+
+            if (m_corpseRemoveTime <= time(NULL))
+            {
+                RemoveCorpse();
+            }
+
+            break;
+        }
+        case ALIVE:
+        {
+            if (m_aggroDelay <= update_diff)
+            {
+                m_aggroDelay = 0;
+            }
+            else
+            {
+                m_aggroDelay -= update_diff;
+            }
+
+            if (m_IsDeadByDefault)
+            {
+                if (m_corpseRemoveTime <= time(NULL))
+                {
+                    RemoveCorpse();
+                    break;
+                }
+            }
+
+            Unit::Update(update_diff, diff);
+
+            // creature can be dead after Unit::Update call
+            // CORPSE/DEAD state will processed at next tick (in other case death timer will be updated unexpectedly)
+            if (!IsAlive())
+            {
+                break;
+            }
+
+            if (!IsInEvadeMode())
+            {
+                if (AI())
+                {
+                    // do not allow the AI to be changed during update
+                    m_AI_locked = true;
+                    AI()->UpdateAI(diff);   // AI not react good at real update delays (while freeze in non-active part of map)
+                    m_AI_locked = false;
+                }
+            }
+
+            // creature can be dead after UpdateAI call
+            // CORPSE/DEAD state will processed at next tick (in other case death timer will be updated unexpectedly)
+            if (!IsAlive())
+            {
+                break;
+            }
+            RegenerateAll(update_diff);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+/**
+ * @brief Starts group loot tracking for this creature.
+ *
+ * @param group The recipient group.
+ * @param timer The loot roll timer.
+ */
+void Creature::StartGroupLoot(Group* group, uint32 timer)
+{
+    m_groupLootId = group->GetId();
+    m_groupLootTimer = timer;
+}
+
+/**
+ * @brief Stops active group loot tracking for this creature.
+ */
+void Creature::StopGroupLoot()
+{
+    if (!m_groupLootId)
+    {
+        return;
+    }
+
+    if (Group* group = sObjectMgr.GetGroupById(m_groupLootId))
+    {
+        group->EndRoll();
+    }
+
+    m_groupLootTimer = 0;
+    m_groupLootId = 0;
+}
+
+/**
+ * @brief Regenerates creature health and power on the regeneration timer.
+ *
+ * @param update_diff The elapsed update time in milliseconds.
+ */
+void Creature::RegenerateAll(uint32 update_diff)
+{
+    if (m_regenTimer > 0)
+    {
+        if (update_diff >= m_regenTimer)
+        {
+            m_regenTimer = 0;
+        }
+        else
+        {
+            m_regenTimer -= update_diff;
+        }
+    }
+    if (m_regenTimer != 0)
+    {
+        return;
+    }
+
+    if (!IsInCombat() || IsPolymorphed())
+    {
+        RegenerateHealth();
+    }
+
+    RegeneratePower();
+
+    m_regenTimer = REGEN_TIME_FULL;
+}
+
+/**
+ * @brief Regenerates the creature's current power type.
+ */
+void Creature::RegeneratePower()
+{
+    if (!IsRegeneratingPower() && !IsPet())
+    {
+        return;
+    }
+
+    Powers powerType = GetPowerType();
+    uint32 curValue = GetPower(powerType);
+    uint32 maxValue = GetMaxPower(powerType);
+
+    if (curValue >= maxValue)
+    {
+        return;
+    }
+
+    float addValue = 0.0f;
+
+    switch (powerType)
+    {
+        case POWER_MANA:
+            // Combat and any controlled creature
+            if (IsInCombat() || GetCharmerOrOwnerGuid())
+            {
+                if (!IsUnderLastManaUseEffect())
+                {
+                    float ManaIncreaseRate = sWorld.getConfig(CONFIG_FLOAT_RATE_POWER_MANA);
+                    float Spirit = GetStat(STAT_SPIRIT);
+
+                    addValue = (Spirit / 5.0f + 17.0f) * ManaIncreaseRate;
+                }
+            }
+            else
+            {
+                addValue = maxValue / 3.0f;
+            }
+            break;
+        case POWER_ENERGY:
+            // ToDo: for vehicle this is different - NEEDS TO BE FIXED!
+            addValue = 20 * sWorld.getConfig(CONFIG_FLOAT_RATE_POWER_ENERGY);
+            break;
+        case POWER_FOCUS:
+            addValue = 24 * sWorld.getConfig(CONFIG_FLOAT_RATE_POWER_FOCUS);
+            break;
+        default:
+            return;
+    }
+
+    // Apply modifiers (if any)
+    AuraList const& ModPowerRegenAuras = GetAurasByType(SPELL_AURA_MOD_POWER_REGEN);
+    for(AuraList::const_iterator i = ModPowerRegenAuras.begin(); i != ModPowerRegenAuras.end(); ++i)
+    {
+        Modifier const* modifier = (*i)->GetModifier();
+        if (modifier->m_miscvalue == int32(powerType))
+        {
+            addValue += modifier->m_amount;
+        }
+    }
+
+    AuraList const& ModPowerRegenPCTAuras = GetAurasByType(SPELL_AURA_MOD_POWER_REGEN_PERCENT);
+    for(AuraList::const_iterator i = ModPowerRegenPCTAuras.begin(); i != ModPowerRegenPCTAuras.end(); ++i)
+    {
+        Modifier const* modifier = (*i)->GetModifier();
+        if (modifier->m_miscvalue == int32(powerType))
+        {
+            addValue *= (modifier->m_amount + 100) / 100.0f;
+        }
+    }
+
+    ModifyPower(powerType, int32(addValue));
+}
+
+/**
+ * @brief Regenerates the creature's health.
+ */
+void Creature::RegenerateHealth()
+{
+    if (!IsRegeneratingHealth())
+    {
+        return;
+    }
+
+    uint32 curValue = GetHealth();
+    uint32 maxValue = GetMaxHealth();
+
+    if (curValue >= maxValue)
+    {
+        return;
+    }
+
+    uint32 addvalue = 0;
+
+    // Not only pet, but any controlled creature
+    if (GetCharmerOrOwnerGuid())
+    {
+        float HealthIncreaseRate = sWorld.getConfig(CONFIG_FLOAT_RATE_HEALTH);
+        float Spirit = GetStat(STAT_SPIRIT); //for charmed creatures, spirit = 0!
+        if (GetPower(POWER_MANA) > 0)
+        {
+            addvalue = uint32(Spirit * 0.25 * HealthIncreaseRate);
+        }
+        else
+        {
+            addvalue = uint32(Spirit * 0.80 * HealthIncreaseRate);
+        }
+    }
+    else
+    {
+        addvalue = maxValue / 3;
+    }
+
+    ModifyHealth(addvalue);
+}
+
+/**
+ * @brief Makes the creature flee toward assistance or fear-run away.
+ */
+void Creature::DoFleeToGetAssistance()
+{
+    if (!getVictim())
+    {
+        return;
+    }
+
+    float radius = sWorld.getConfig(CONFIG_FLOAT_CREATURE_FAMILY_FLEE_ASSISTANCE_RADIUS);
+    if (radius > 0)
+    {
+        Creature* pCreature = NULL;
+
+        MaNGOS::NearestAssistCreatureInCreatureRangeCheck u_check(this, getVictim(), radius);
+        MaNGOS::CreatureLastSearcher<MaNGOS::NearestAssistCreatureInCreatureRangeCheck> searcher(pCreature, u_check);
+        Cell::VisitGridObjects(this, searcher, radius);
+
+        SetNoSearchAssistance(true);
+        UpdateSpeed(MOVE_RUN, false);
+
+        if (!pCreature)
+        {
+            SetFeared(true, getVictim()->GetObjectGuid(), 0 , sWorld.getConfig(CONFIG_UINT32_CREATURE_FAMILY_FLEE_DELAY));
+        }
+        else
+        {
+            SetTargetGuid(ObjectGuid());        // creature flee loose its target
+            GetMotionMaster()->MoveSeekAssistance(pCreature->Where().X(), pCreature->Where().Y(), pCreature->Where().Z());
+        }
+    }
+}
+
+/**
+ * @brief Initializes the creature AI and motion master.
+ *
+ * @return true if initialization succeeded; otherwise, false.
+ */
+bool Creature::AIM_Initialize()
+{
+    // make sure nothing can change the AI during AI update
+    if (m_AI_locked)
+    {
+        DEBUG_FILTER_LOG(LOG_FILTER_AI_AND_MOVEGENSS, "AIM_Initialize: failed to init, locked.");
+        return false;
+    }
+
+    CreatureAI* oldAI = i_AI;
+    i_motionMaster.Initialize();
+    i_AI = FactorySelector::selectAI(this);
+    delete oldAI;
+    return true;
+}
+
+/**
+ * @brief Creates a creature from template and spawn position data.
+ *
+ * @param guidlow The low GUID to assign.
+ * @param cPos The creation position helper.
+ * @param cinfo The creature template.
+ * @param team Optional team override.
+ * @param data Optional static spawn data.
+ * @param eventData Optional event override data.
+ * @return true if creation succeeded; otherwise, false.
+ */
+bool Creature::Create(uint32 guidlow, CreatureCreatePos& cPos, CreatureInfo const* cinfo, Team team /*= TEAM_NONE*/, const CreatureData* data /*= NULL*/, GameEventCreatureData const* eventData /*= NULL*/)
+{
+    SetMap(cPos.GetMap());
+
+    if (!CreateFromProto(guidlow, cinfo, team, data, eventData))
+    {
+        return false;
+    }
+
+    cPos.SelectFinalPoint(this);
+
+    if (!cPos.PlaceOn(this))
+    {
+        return false;
+    }
+
+    // Notify the outdoor pvp script
+    if (OutdoorPvP* outdoorPvP = sOutdoorPvPMgr.GetScript(GetTerrain()->GetZoneId(Where().X(), Where().Y(), Where().Z())))
+    {
+        outdoorPvP->HandleCreatureCreate(this);
+    }
+
+    // Notify the map's instance data.
+    // Only works if you create the object in it, not if it is moves to that map.
+    // Normally non-players do not teleport to other maps.
+    if (InstanceData* iData = GetMap()->GetInstanceData())
+    {
+        iData->OnCreatureCreate(this);
+    }
+
+    switch (GetCreatureInfo()->Rank)
+    {
+        case CREATURE_ELITE_RARE:
+            m_corpseDelay = sWorld.getConfig(CONFIG_UINT32_CORPSE_DECAY_RARE);
+            break;
+        case CREATURE_ELITE_ELITE:
+            m_corpseDelay = sWorld.getConfig(CONFIG_UINT32_CORPSE_DECAY_ELITE);
+            break;
+        case CREATURE_ELITE_RAREELITE:
+            m_corpseDelay = sWorld.getConfig(CONFIG_UINT32_CORPSE_DECAY_RAREELITE);
+            break;
+        case CREATURE_ELITE_WORLDBOSS:
+            m_corpseDelay = sWorld.getConfig(CONFIG_UINT32_CORPSE_DECAY_WORLDBOSS);
+            break;
+        default:
+            m_corpseDelay = sWorld.getConfig(CONFIG_UINT32_CORPSE_DECAY_NORMAL);
+            break;
+    }
+
+    // Add to CreatureLinkingHolder if needed
+    if (sCreatureLinkingMgr.GetLinkedTriggerInformation(this))
+    {
+        cPos.GetMap()->GetCreatureLinkingHolder()->AddSlaveToHolder(this);
+    }
+    if (sCreatureLinkingMgr.IsLinkedEventTrigger(this))
+    {
+        m_isCreatureLinkingTrigger = true;
+        cPos.GetMap()->GetCreatureLinkingHolder()->AddMasterToHolder(this);
+    }
+
+    LoadCreatureAddon(false);
+
+    return true;
+}
+
+/**
+ * @brief Checks whether this creature can train the specified player.
+ *
+ * @param pPlayer The player requesting training.
+ * @param msg true to send denial gossip messages.
+ * @return true if the player may train here; otherwise, false.
+ */
+bool Creature::IsTrainerOf(Player* pPlayer, bool msg) const
+{
+    if (!IsTrainer())
+    {
+        return false;
+    }
+
+    TrainerSpellData const* cSpells = GetTrainerSpells();
+    TrainerSpellData const* tSpells = GetTrainerTemplateSpells();
+
+    // for not pet trainer expected not empty trainer list always
+    if ((!cSpells || cSpells->spellList.empty()) && (!tSpells || tSpells->spellList.empty()))
+    {
+        sLog.outErrorDb("Creature %u (Entry: %u) have UNIT_NPC_FLAG_TRAINER but have empty trainer spell list.",
+                        GetGUIDLow(), GetEntry());
+        return false;
+    }
+
+    switch (GetCreatureInfo()->TrainerType)
+    {
+        case TRAINER_TYPE_CLASS:
+            if (pPlayer->getClass() != GetCreatureInfo()->TrainerClass)
+            {
+                if (msg)
+                {
+                    pPlayer->PlayerTalkClass->ClearMenus();
+                    switch (GetCreatureInfo()->TrainerClass)
+                    {
+                        case CLASS_DRUID:  pPlayer->PlayerTalkClass->SendGossipMenu(4913, GetObjectGuid()); break;
+                        case CLASS_HUNTER: pPlayer->PlayerTalkClass->SendGossipMenu(10090, GetObjectGuid()); break;
+                        case CLASS_MAGE:   pPlayer->PlayerTalkClass->SendGossipMenu(328, GetObjectGuid()); break;
+                        case CLASS_PALADIN: pPlayer->PlayerTalkClass->SendGossipMenu(1635, GetObjectGuid()); break;
+                        case CLASS_PRIEST: pPlayer->PlayerTalkClass->SendGossipMenu(4436, GetObjectGuid()); break;
+                        case CLASS_ROGUE:  pPlayer->PlayerTalkClass->SendGossipMenu(4797, GetObjectGuid()); break;
+                        case CLASS_SHAMAN: pPlayer->PlayerTalkClass->SendGossipMenu(5003, GetObjectGuid()); break;
+                        case CLASS_WARLOCK: pPlayer->PlayerTalkClass->SendGossipMenu(5836, GetObjectGuid()); break;
+                        case CLASS_WARRIOR: pPlayer->PlayerTalkClass->SendGossipMenu(4985, GetObjectGuid()); break;
+                    }
+                }
+                return false;
+            }
+            break;
+        case TRAINER_TYPE_PETS:
+            if (pPlayer->getClass() != CLASS_HUNTER)
+            {
+                if (msg)
+                {
+                    pPlayer->PlayerTalkClass->ClearMenus();
+                    pPlayer->PlayerTalkClass->SendGossipMenu(3620, GetObjectGuid());
+                }
+                return false;
+            }
+            break;
+        case TRAINER_TYPE_MOUNTS:
+            if (GetCreatureInfo()->TrainerRace && pPlayer->getRace() != GetCreatureInfo()->TrainerRace)
+            {
+                // Allowed to train if exalted
+                if (FactionTemplateEntry const* faction_template = getFactionTemplateEntry())
+                {
+                    if (pPlayer->GetReputationRank(faction_template->faction) == REP_EXALTED)
+                    {
+                        return true;
+                    }
+                }
+
+                if (msg)
+                {
+                    pPlayer->PlayerTalkClass->ClearMenus();
+                    switch (GetCreatureInfo()->TrainerClass)
+                    {
+                        case RACE_DWARF:        pPlayer->PlayerTalkClass->SendGossipMenu(5865, GetObjectGuid()); break;
+                        case RACE_GNOME:        pPlayer->PlayerTalkClass->SendGossipMenu(4881, GetObjectGuid()); break;
+                        case RACE_HUMAN:        pPlayer->PlayerTalkClass->SendGossipMenu(5861, GetObjectGuid()); break;
+                        case RACE_NIGHTELF:     pPlayer->PlayerTalkClass->SendGossipMenu(5862, GetObjectGuid()); break;
+                        case RACE_ORC:          pPlayer->PlayerTalkClass->SendGossipMenu(5863, GetObjectGuid()); break;
+                        case RACE_TAUREN:       pPlayer->PlayerTalkClass->SendGossipMenu(5864, GetObjectGuid()); break;
+                        case RACE_TROLL:        pPlayer->PlayerTalkClass->SendGossipMenu(5816, GetObjectGuid()); break;
+                        case RACE_UNDEAD:       pPlayer->PlayerTalkClass->SendGossipMenu(624, GetObjectGuid()); break;
+                        case RACE_BLOODELF:     pPlayer->PlayerTalkClass->SendGossipMenu(5862, GetObjectGuid()); break;
+                        case RACE_DRAENEI:      pPlayer->PlayerTalkClass->SendGossipMenu(5864, GetObjectGuid()); break;
+                    }
+                }
+                return false;
+            }
+            break;
+        case TRAINER_TYPE_TRADESKILLS:
+            if (GetCreatureInfo()->TrainerSpell && !pPlayer->HasSpell(GetCreatureInfo()->TrainerSpell))
+            {
+                if (msg)
+                {
+                    pPlayer->PlayerTalkClass->ClearMenus();
+                    pPlayer->PlayerTalkClass->SendGossipMenu(11031, GetObjectGuid());
+                }
+                return false;
+            }
+            break;
+        default:
+            return false;                                   // checked and error output at creature_template loading
+    }
+    return true;
+}
+
+/**
+ * @brief Checks whether a player may interact with this battlemaster.
+ *
+ * @param pPlayer The player requesting interaction.
+ * @param msg true to send denial gossip messages.
+ * @return true if the player may interact; otherwise, false.
+ */
+bool Creature::CanInteractWithBattleMaster(Player* pPlayer, bool msg) const
+{
+    if (!IsBattleMaster())
+    {
+        return false;
+    }
+
+    BattleGroundTypeId bgTypeId = sBattleGroundMgr.GetBattleMasterBG(GetEntry());
+    if (bgTypeId == BATTLEGROUND_TYPE_NONE)
+    {
+        return false;
+    }
+
+    if (!msg)
+    {
+        return pPlayer->GetBGAccessByLevel(bgTypeId);
+    }
+
+    if (!pPlayer->GetBGAccessByLevel(bgTypeId))
+    {
+        pPlayer->PlayerTalkClass->ClearMenus();
+        switch (bgTypeId)
+        {
+            case BATTLEGROUND_AV:  pPlayer->PlayerTalkClass->SendGossipMenu(7616, GetObjectGuid()); break;
+            case BATTLEGROUND_WS:  pPlayer->PlayerTalkClass->SendGossipMenu(7599, GetObjectGuid()); break;
+            case BATTLEGROUND_AB:  pPlayer->PlayerTalkClass->SendGossipMenu(7642, GetObjectGuid()); break;
+            case BATTLEGROUND_EY:
+            case BATTLEGROUND_NA:
+            case BATTLEGROUND_BE:
+            case BATTLEGROUND_AA:
+            case BATTLEGROUND_RL:
+                pPlayer->PlayerTalkClass->SendGossipMenu(10024, GetObjectGuid());
+                break;
+            default: break;
+        }
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Checks whether this trainer may train and reset a player's talents.
+ *
+ * @param pPlayer The player requesting a talent reset.
+ * @return true if the reset is allowed; otherwise, false.
+ */
+bool Creature::CanTrainAndResetTalentsOf(Player* pPlayer) const
+{
+    return pPlayer->getLevel() >= 10
+           && GetCreatureInfo()->TrainerType == TRAINER_TYPE_CLASS
+           && pPlayer->getClass() == GetCreatureInfo()->TrainerClass;
+}
+
+/**
+ * @brief Prepares the corpse state for body loot and optional skinning.
+ */
+void Creature::PrepareBodyLootState()
+{
+    loot.clear();
+
+    // if have normal loot then prepare it access
+    if (!lootForBody)
+    {
+        // have normal loot
+        if (GetCreatureInfo()->MaxLootGold > 0 || GetCreatureInfo()->LootId || (GetCreatureType() != CREATURE_TYPE_CRITTER && (GetCreatureInfo()->SkinningLootId && sWorld.getConfig(CONFIG_BOOL_CORPSE_EMPTY_LOOT_SHOW))))
+        {
+            SetFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE);
+            return;
+        }
+    }
+
+    lootForBody = true; // pass this loot mode
+
+    // if not have normal loot allow skinning if need
+    if (!lootForSkin && GetCreatureInfo()->SkinningLootId)
+    {
+      RemoveFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE);
+      SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SKINNABLE);
+      return;
+    }
+
+    RemoveFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE);
+    RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SKINNABLE);
+}
+
+/**
+ * Return original player who tap creature, it can be different from player/group allowed to loot so not use it for loot code
+ */
+/**
+ * @brief Gets the original player who tapped the creature.
+ *
+ * @return The original loot recipient player, or null if unavailable.
+ */
+Player* Creature::GetOriginalLootRecipient() const
+{
+    return m_lootRecipientGuid ? sPlayerRegistry.Find(m_lootRecipientGuid) : NULL;
+}
+
+/**
+ * Return group if player tap creature as group member, independent is player after leave group or stil be group member
+ */
+/**
+ * @brief Gets the original group loot recipient.
+ *
+ * @return The group that owns loot rights, or null if unavailable.
+ */
+Group* Creature::GetGroupLootRecipient() const
+{
+    // original recipient group if set and not disbanded
+    return m_lootGroupRecipientId ? sObjectMgr.GetGroupById(m_lootGroupRecipientId) : NULL;
+}
+
+/**
+ * Return player who can loot tapped creature (member of group or single player)
+ *
+ * In case when original player tap creature as group member then group tap prefered.
+ * This is for example important if player after tap leave group.
+ * If group not exist or disbanded or player tap creature not as group member return player
+ */
+/**
+ * @brief Gets the player who currently owns loot rights for this creature.
+ *
+ * @return The effective loot recipient player, or null if none.
+ */
+Player* Creature::GetLootRecipient() const
+{
+    // original recipient group if set and not disbanded
+    Group* group = GetGroupLootRecipient();
+
+    // original recipient player if online
+    Player* player = GetOriginalLootRecipient();
+
+    // if group not set or disbanded return original recipient player if any
+    if (!group)
+    {
+        return player;
+    }
+
+    // group case
+
+    // return player if it still be in original recipient group
+    if (player && player->GetGroup() == group)
+    {
+        return player;
+    }
+
+    // find any in group
+    for (GroupReference* itr = group->GetFirstMember(); itr != NULL; itr = itr->next())
+    {
+        if (Player* p = itr->getSource())
+        {
+            return p;
+        }
+    }
+
+    return NULL;
+}
+
+/**
+ * Set player and group (if player group member) who tap creature
+ */
+/**
+ * @brief Assigns loot rights to a unit and its group if applicable.
+ *
+ * @param unit The unit receiving loot rights, or null to clear them.
+ */
+void Creature::SetLootRecipient(Unit* unit)
+{
+    // set the player whose group should receive the right
+    // to loot the creature after it dies
+    // should be set to NULL after the loot disappears
+
+    if (!unit)
+    {
+        m_lootRecipientGuid.Clear();
+        m_lootGroupRecipientId = 0;
+        return;
+    }
+
+    Player* player = unit->GetCharmerOrOwnerPlayerOrPlayerItself();
+    if (!player)                                            // normal creature, no player involved
+    {
+        return;
+    }
+
+    // set player for non group case or if group will disbanded
+    m_lootRecipientGuid = player->GetObjectGuid();
+
+    // set group for group existing case including if player will leave group at loot time
+    if (Group* group = player->GetGroup())
+    {
+        m_lootGroupRecipientId = group->GetId();
+    }
+
+    SetFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_TAPPED);
+}
+
+/**
+ * @brief Saves the currently loaded creature to the database.
+ */
+void Creature::SaveToDB()
+{
+    // this should only be used when the creature has already been loaded
+    // preferably after adding to map, because mapid may not be valid otherwise
+    CreatureData const* data = sObjectMgr.GetCreatureData(GetGUIDLow());
+    if (!data)
+    {
+        sLog.outError("Creature::SaveToDB failed, can not get creature data!");
+        return;
+    }
+
+    SaveToDB(GetMapId(), data->spawnMask);
+}
+
+// return true if this creature is tapped by the player or by a member of his group.
+/**
+ * @brief Checks whether the creature is tapped by a player or that player's group.
+ *
+ * @param player The player to test.
+ * @return true if the player has tap rights; otherwise, false.
+ */
+bool Creature::IsTappedBy(Player const* player) const
+{
+    if (player == GetOriginalLootRecipient())
+    {
+        return true;
+    }
+
+    Group const* playerGroup = player->GetGroup();
+    if (!playerGroup || playerGroup != GetGroupLootRecipient()) // if we dont have a group we arent the recipient
+    {
+        return false;                                           // if creature doesnt have group bound it means it was solo killed by someone else
+    }
+
+    return true;
+}
+
+/**
+ * @brief Saves the creature spawn record to the database for a map.
+ *
+ * @param mapid The map id to persist.
+ */
+void Creature::SaveToDB(uint32 mapid, uint8 spawnMask)
+{
+    // update in loaded data
+    CreatureData& data = sObjectMgr.NewOrExistCreatureData(GetGUIDLow());
+
+    uint32 displayId = GetNativeDisplayId();
+
+    // check if it's a custom model and if not, use 0 for displayId
+    CreatureInfo const* cinfo = GetCreatureInfo();
+    if (cinfo)
+    {
+        // The following if-else assumes that there are 4 model fields and needs updating if this is changed.
+
+        if (displayId != cinfo->ModelId[0] && displayId != cinfo->ModelId[1] &&
+            displayId != cinfo->ModelId[2] && displayId != cinfo->ModelId[3])
+        {
+            for (int i = 0; i < MAX_CREATURE_MODEL && displayId; ++i)
+            {
+                if (cinfo->ModelId[i])
+                {
+                    if (CreatureModelInfo const* minfo = sObjectMgr.GetCreatureModelInfo(cinfo->ModelId[i]))
+                    {
+                        if (displayId == minfo->modelid_other_gender)
+                        {
+                            displayId = 0;
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            displayId = 0;
+        }
+    }
+
+    // data->guid = guid don't must be update at save
+    data.id = GetEntry();
+    data.mapid = mapid;
+    data.spawnMask = spawnMask;
+    data.modelid_override = displayId;
+    data.equipmentId = GetEquipmentId();
+    data.posX = Where().X();
+    data.posY = Where().Y();
+    data.posZ = Where().Z();
+    data.orientation = Where().Facing();
+    data.spawntimesecs = m_respawnDelay;
+    // prevent add data integrity problems
+    data.spawndist = GetDefaultMovementType() == IDLE_MOTION_TYPE ? 0 : m_respawnradius;
+    data.currentwaypoint = 0;
+    data.curhealth = GetHealth();
+    data.curmana = GetPower(POWER_MANA);
+    data.is_dead = m_IsDeadByDefault;
+    // prevent add data integrity problems
+    data.movementType = !m_respawnradius && GetDefaultMovementType() == RANDOM_MOTION_TYPE
+                        ? IDLE_MOTION_TYPE : GetDefaultMovementType();
+
+    // updated in DB
+    WorldDatabase.BeginTransaction();
+
+    WorldDatabase.PExecuteLog("DELETE FROM `creature` WHERE `guid`=%u", GetGUIDLow());
+
+    std::ostringstream ss;
+    ss << "INSERT INTO `creature` VALUES ("
+       << GetGUIDLow() << ","
+       << data.id << ","
+       << data.mapid << ","
+       << uint32(data.spawnMask) << ","                    // cast to prevent save as symbol
+       << data.modelid_override << ","
+       << data.equipmentId << ","
+       << data.posX << ","
+       << data.posY << ","
+       << data.posZ << ","
+       << data.orientation << ","
+       << data.spawntimesecs << ","                        // respawn time
+       << (float) data.spawndist << ","                    // spawn distance (float)
+       << data.currentwaypoint << ","                      // currentwaypoint
+       << data.curhealth << ","                            // curhealth
+       << data.curmana << ","                              // curmana
+       << (data.is_dead  ? 1 : 0) << ","                   // is_dead
+       << uint32(data.movementType) << ")";                // default movement generator type, cast to prevent save as symbol
+
+    WorldDatabase.PExecuteLog("%s", ss.str().c_str());
+
+    WorldDatabase.CommitTransaction();
+}
+
+
+
+
+/**
+ * @brief Lowers the remaining player damage requirement for loot eligibility.
+ *
+ * @param unDamage The damage amount to subtract.
+ */
+void Creature::LowerPlayerDamageReq(uint32 unDamage)
+{
+    if (m_PlayerDamageReq)
+    {
+        m_PlayerDamageReq > unDamage ? m_PlayerDamageReq -= unDamage : m_PlayerDamageReq = 0;
+    }
+}
+
+
+/**
+ * @brief Creates creature runtime state from a template prototype.
+ *
+ * @param guidlow The low GUID to assign.
+ * @param cinfo The creature template.
+ * @param team Optional team override.
+ * @param data Optional spawn data.
+ * @param eventData Optional event override data.
+ * @return true if creation succeeded; otherwise, false.
+ */
+bool Creature::CreateFromProto(uint32 guidlow, CreatureInfo const* cinfo, Team team, const CreatureData* data /*=NULL*/, GameEventCreatureData const* eventData /*=NULL*/)
+{
+    m_originalEntry = cinfo->Entry;
+
+    Object::_Create(guidlow, cinfo->Entry, cinfo->GetHighGuid());
+
+    if (!UpdateEntry(cinfo->Entry, team, data, eventData, false))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Loads a creature instance from database spawn data.
+ *
+ * @param guidlow The creature database GUID.
+ * @param map The map to load the creature into.
+ * @return true if loading succeeded; otherwise, false.
+ */
+bool Creature::LoadFromDB(uint32 guidlow, Map* map)
+{
+    CreatureData const* data = sObjectMgr.GetCreatureData(guidlow);
+
+    if (!data)
+    {
+        sLog.outErrorDb("Creature (GUID: %u) not found in table `creature`, can't load. ", guidlow);
+        return false;
+    }
+
+    CreatureInfo const* cinfo = ObjectMgr::GetCreatureTemplate(data->id);
+    if (!cinfo)
+    {
+        sLog.outErrorDb("Creature (Entry: %u) not found in table `creature_template`, can't load. ", data->id);
+        return false;
+    }
+
+    GameEventCreatureData const* eventData = sGameEventMgr.GetCreatureUpdateDataForActiveEvent(guidlow);
+
+    // Creature can be loaded already in map if grid has been unloaded while creature walk to another grid
+    if (map->GetCreature(cinfo->GetObjectGuid(guidlow)))
+    {
+        return false;
+    }
+
+    CreatureCreatePos pos(map, data->posX, data->posY, data->posZ, data->orientation);
+
+    if (!Create(guidlow, pos, cinfo, TEAM_NONE, data, eventData))
+    {
+        return false;
+    }
+
+    SetSpawn(pos);
+    m_respawnradius = data->spawndist;
+
+    m_respawnDelay = data->spawntimesecs;
+    m_corpseDelay = std::min(m_respawnDelay * 9 / 10, m_corpseDelay); // set corpse delay to 90% of the respawn delay
+    m_IsDeadByDefault = data->is_dead;
+    m_deathState = m_IsDeadByDefault ? DEAD : ALIVE;
+
+    m_respawnTime  = map->GetPersistentState()->GetCreatureRespawnTime(GetGUIDLow());
+
+    if (m_respawnTime > time(NULL))                         // not ready to respawn
+    {
+        m_deathState = DEAD;
+        if (CanFly())
+        {
+            const auto spawnFloor = GetMap()->GetTerrain()->StaticFloor(data->posX, data->posY, data->posZ);
+                float tz = spawnFloor ? *spawnFloor : INVALID_HEIGHT;
+            if (data->posZ - tz > 0.1)
+            {
+                Place().MoveTo(data->posX, data->posY, tz);
+            }
+        }
+    }
+    else if (m_respawnTime)                                 // respawn time set but expired
+    {
+        m_respawnTime = 0;
+
+        GetMap()->GetPersistentState()->SaveCreatureRespawnTime(GetGUIDLow(), 0);
+    }
+
+    uint32 curhealth = data->curhealth;
+    if (curhealth)
+    {
+        curhealth = uint32(curhealth * _GetHealthMod(GetCreatureInfo()->Rank));
+        if (curhealth < 1)
+        {
+            curhealth = 1;
+        }
+    }
+
+    if (sCreatureLinkingMgr.IsSpawnedByLinkedMob(this))
+    {
+        m_isSpawningLinked = true;
+        if (m_deathState == ALIVE && !GetMap()->GetCreatureLinkingHolder()->CanSpawn(this))
+        {
+            m_deathState = DEAD;
+
+            // Just set to dead, so need to relocate like above
+            if (CanFly())
+            {
+                const auto spawnFloor = GetMap()->GetTerrain()->StaticFloor(data->posX, data->posY, data->posZ);
+                float tz = spawnFloor ? *spawnFloor : INVALID_HEIGHT;
+                if (data->posZ - tz > 0.1)
+                {
+                    Place().MoveTo(data->posX, data->posY, tz);
+                }
+            }
+        }
+    }
+
+    SetHealth(m_deathState == ALIVE ? curhealth : 0);
+    SetPower(POWER_MANA, data->curmana);
+
+    SetMeleeDamageSchool(SpellSchools(GetCreatureInfo()->DamageSchool));
+
+    // checked at creature_template loading
+    m_defaultMovementType = MovementGeneratorType(data->movementType);
+
+    map->Add(this);
+
+    AIM_Initialize();
+
+    // Creature Linking, Initial load is handled like respawn
+    if (m_isCreatureLinkingTrigger && IsAlive())
+    {
+        GetMap()->GetCreatureLinkingHolder()->DoCreatureLinkingEvent(LINKING_EVENT_RESPAWN, this);
+    }
+
+    // check if it is rabbit day
+    if (IsAlive() && sWorld.getConfig(CONFIG_UINT32_RABBIT_DAY))
+    {
+        time_t rabbit_day = time_t(sWorld.getConfig(CONFIG_UINT32_RABBIT_DAY));
+        std::tm rabbit_day_tm = safe_localtime(rabbit_day);
+        std::tm now_tm = safe_localtime(sWorld.GetGameTime());
+
+        if (now_tm.tm_mon == rabbit_day_tm.tm_mon && now_tm.tm_mday == rabbit_day_tm.tm_mday)
+        {
+            CastSpell(this, 10710 + urand(0, 2), true);
+        }
+    }
+
+    return true;
+}
+
+/**
+ * @brief Loads creature equipment from an equipment template.
+ *
+ * @param equip_entry The equipment template id.
+ * @param force true to clear equipment when entry is zero.
+ */
+void Creature::LoadEquipment(uint32 equip_entry, bool force)
+{
+    if (equip_entry == 0)
+    {
+        if (force)
+        {
+            for (uint8 i = 0; i < MAX_VIRTUAL_ITEM_SLOT; ++i)
+            {
+                SetVirtualItem(VirtualItemSlot(i), 0);
+            }
+            m_equipmentId = 0;
+        }
+        return;
+    }
+
+    if (EquipmentInfo const* einfo = sObjectMgr.GetEquipmentInfo(equip_entry))
+    {
+        m_equipmentId = equip_entry;
+        for (uint8 i = 0; i < MAX_VIRTUAL_ITEM_SLOT; ++i)
+        {
+            SetVirtualItem(VirtualItemSlot(i), einfo->equipentry[i]);
+        }
+    }
+    else if (EquipmentInfoRaw const* einfo = sObjectMgr.GetEquipmentInfoRaw(equip_entry))
+    {
+        m_equipmentId = equip_entry;
+        for (uint8 i = 0; i < MAX_VIRTUAL_ITEM_SLOT; ++i)
+        {
+            SetVirtualItemRaw(VirtualItemSlot(i), einfo->equipmodel[i], einfo->equipinfo[i], einfo->equipslot[i]);
+        }
+    }
+}
+
+/**
+ * @brief Checks whether this creature starts the specified quest.
+ *
+ * @param quest_id The quest identifier.
+ * @return true if the quest is related to this creature; otherwise, false.
+ */
+bool Creature::HasQuest(uint32 quest_id) const
+{
+    QuestRelationsMapBounds bounds = sObjectMgr.GetCreatureQuestRelationsMapBounds(GetEntry());
+    for (QuestRelationsMap::const_iterator itr = bounds.first; itr != bounds.second; ++itr)
+    {
+        if (itr->second == quest_id)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Checks whether this creature is involved in the specified quest.
+ *
+ * @param quest_id The quest identifier.
+ * @return true if the quest is an involved relation for this creature; otherwise, false.
+ */
+bool Creature::HasInvolvedQuest(uint32 quest_id) const
+{
+    QuestRelationsMapBounds bounds = sObjectMgr.GetCreatureQuestInvolvedRelationsMapBounds(GetEntry());
+    for (QuestRelationsMap::const_iterator itr = bounds.first; itr != bounds.second; ++itr)
+    {
+        if (itr->second == quest_id)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+struct CreatureRespawnDeleteWorker
+{
+    explicit CreatureRespawnDeleteWorker(uint32 guid) : i_guid(guid) {}
+
+    void operator()(MapPersistentState* state)
+    {
+        state->SaveCreatureRespawnTime(i_guid, 0);
+    }
+
+    uint32 i_guid;
+};
+
+/**
+ * @brief Deletes this creature's saved spawn data from the database.
+ */
+void Creature::DeleteFromDB()
+{
+    CreatureData const* data = sObjectMgr.GetCreatureData(GetGUIDLow());
+    if (!data)
+    {
+        DEBUG_LOG("Trying to delete not saved creature!");
+        return;
+    }
+
+    DeleteFromDB(GetGUIDLow(), data);
+}
+
+/**
+ * @brief Deletes a creature spawn record and related DB state.
+ *
+ * @param lowguid The creature database GUID.
+ * @param data The static creature spawn data.
+ */
+void Creature::DeleteFromDB(uint32 lowguid, CreatureData const* data)
+{
+    CreatureRespawnDeleteWorker worker(lowguid);
+    sMapPersistentStateMgr.DoForAllStatesWithMapId(data->mapid, worker);
+
+    sObjectMgr.DeleteCreatureData(lowguid);
+
+    WorldDatabase.BeginTransaction();
+    WorldDatabase.PExecuteLog("DELETE FROM `creature` WHERE `guid`=%u", lowguid);
+    WorldDatabase.PExecuteLog("DELETE FROM `creature_addon` WHERE `guid`=%u", lowguid);
+    WorldDatabase.PExecuteLog("DELETE FROM `creature_movement` WHERE `id`=%u", lowguid);
+    WorldDatabase.PExecuteLog("DELETE FROM `game_event_creature` WHERE `guid`=%u", lowguid);
+    WorldDatabase.PExecuteLog("DELETE FROM `game_event_creature_data` WHERE `guid`=%u", lowguid);
+    WorldDatabase.PExecuteLog("DELETE FROM `creature_battleground` WHERE `guid`=%u", lowguid);
+    WorldDatabase.PExecuteLog("DELETE FROM `creature_linking` WHERE `guid`=%u OR `master_guid`=%u", lowguid, lowguid);
+    WorldDatabase.CommitTransaction();
+}
+
+/**
+ * @brief Computes the aggro attack distance against a target unit.
+ *
+ * @param pl The potential victim.
+ * @return The aggro distance in yards.
+ */
+float Creature::GetAttackDistance(Unit const* pl) const
+{
+    float aggroRate = sWorld.getConfig(CONFIG_FLOAT_RATE_CREATURE_AGGRO);
+    if (aggroRate == 0)
+    {
+        return 0.0f;
+    }
+
+    uint32 playerlevel   = pl->GetLevelForTarget(this);
+    uint32 creaturelevel = GetLevelForTarget(pl);
+
+    int32 leveldif       = int32(playerlevel) - int32(creaturelevel);
+
+    // "The maximum Aggro Radius has a cap of 25 levels under. Example: A level 30 char has the same Aggro Radius of a level 5 char on a level 60 mob."
+    if (leveldif < - 25)
+    {
+        leveldif = -25;
+    }
+
+    // "The aggro radius of a mob having the same level as the player is roughly 20 yards"
+    float RetDistance = 20;
+
+    // "Aggro Radius varies with level difference at a rate of roughly 1 yard/level"
+    // radius grow if playlevel < creaturelevel
+    RetDistance -= (float)leveldif;
+
+    if (creaturelevel + 5 <= sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
+    {
+        // detect range auras
+        RetDistance += GetTotalAuraModifier(SPELL_AURA_MOD_DETECT_RANGE);
+
+        // detected range auras
+        RetDistance += pl->GetTotalAuraModifier(SPELL_AURA_MOD_DETECTED_RANGE);
+    }
+
+    // "Minimum Aggro Radius for a mob seems to be combat range (5 yards)"
+    if (RetDistance < 5)
+    {
+        RetDistance = 5;
+    }
+
+    return (RetDistance * aggroRate);
+}
+
+/**
+ * @brief Updates creature death-state transitions and related respawn behavior.
+ *
+ * @param s The new death state.
+ */
+void Creature::SetDeathState(DeathState s)
+{
+    if ((s == JUST_DIED && !m_IsDeadByDefault) || (s == JUST_ALIVED && m_IsDeadByDefault))
+    {
+        m_corpseRemoveTime = time(NULL) + m_corpseDelay; // the max/default time for corpse decay (before creature is looted/AllLootRemovedFromCorpse() is called)
+        m_respawnTime = time(NULL) + m_respawnDelay;        // respawn delay (spawntimesecs)
+
+        // always save boss respawn time at death to prevent crash cheating
+        if (sWorld.getConfig(CONFIG_BOOL_SAVE_RESPAWN_TIME_IMMEDIATELY) || IsWorldBoss())
+        {
+            SaveRespawnTime();
+        }
+    }
+
+    Unit::SetDeathState(s);
+
+    if (s == JUST_DIED)
+    {
+        SetTargetGuid(ObjectGuid());                        // remove target selection in any cases (can be set at aura remove in Unit::SetDeathState)
+        SetUInt32Value(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_NONE);
+
+        if (HasSearchedAssistance())
+        {
+            SetNoSearchAssistance(false);
+            UpdateSpeed(MOVE_RUN, false);
+        }
+
+        if (CanFly())
+        {
+            i_motionMaster.MoveFall();
+        }
+
+        Unit::SetDeathState(CORPSE);
+    }
+
+    if (s == JUST_ALIVED)
+    {
+        clearUnitState(UNIT_STAT_ALL_STATE);
+
+        Unit::SetDeathState(ALIVE);
+
+        SetHealth(GetMaxHealth());
+        SetLootRecipient(NULL);
+        if (GetTemporaryFactionFlags() & TEMPFACTION_RESTORE_RESPAWN)
+        {
+            ClearTemporaryFaction();
+        }
+
+        SetMeleeDamageSchool(SpellSchools(GetCreatureInfo()->DamageSchool));
+
+        // Dynamic flags must be set on Tapped by default.
+        SetUInt32Value(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_NONE);
+        LoadCreatureAddon(true);
+        ResetPlayerDamageReq();
+
+        // Flags after LoadCreatureAddon. Any spell in *addon
+        // will not be able to adjust these.
+        SetUInt32Value(UNIT_NPC_FLAGS, GetCreatureInfo()->NpcFlags);
+        RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SKINNABLE);
+
+        SetWalk(true, true);
+        i_motionMaster.Initialize();
+    }
+}
+
+/**
+ * @brief Forces the creature to respawn on the next update cycle.
+ */
+void Creature::Respawn()
+{
+    RemoveCorpse();
+    if (!IsInWorld())                                       // Could be removed as part of a pool (in which case respawn-time is handled with pool-system)
+    {
+        return;
+    }
+
+    if (IsDespawned())
+    {
+        if (HasStaticDBSpawnData())
+        {
+            GetMap()->GetPersistentState()->SaveCreatureRespawnTime(GetGUIDLow(), 0);
+        }
+        m_respawnTime = time(NULL);                         // respawn at next tick
+    }
+}
+
+/**
+ * @brief Despawns the creature immediately or after a delay.
+ *
+ * @param timeMSToDespawn Optional delay before despawning, in milliseconds.
+ */
+void Creature::ForcedDespawn(uint32 timeMSToDespawn)
+{
+    if (timeMSToDespawn)
+    {
+        ForcedDespawnDelayEvent* pEvent = new ForcedDespawnDelayEvent(*this);
+
+        m_Events.AddEvent(pEvent, m_Events.CalculateTime(timeMSToDespawn));
+        return;
+    }
+
+    if (IsDespawned())
+    {
+        return;
+    }
+
+    if (IsAlive())
+    {
+        SetDeathState(JUST_DIED);
+    }
+
+    RemoveCorpse(true);                                     // force corpse removal in the same grid
+
+    SetHealth(0);                                           // just for nice GM-mode view
+}
+
+/**
+ * @brief Checks whether the creature is immune to a spell.
+ *
+ * @param spellInfo The spell being evaluated.
+ * @param castOnSelf true if the spell is self-cast.
+ * @return true if the creature is immune; otherwise, false.
+ */
+bool Creature::IsImmuneToSpell(SpellEntry const* spellInfo, bool castOnSelf)
+{
+    if (!spellInfo)
+    {
+        return false;
+    }
+
+    if (!castOnSelf)
+    {
+        if (GetCreatureInfo()->MechanicImmuneMask & (1 << (spellInfo->Mechanic - 1)))
+        {
+            return true;
+        }
+
+        if (GetCreatureInfo()->SchoolImmuneMask & spellInfo->SchoolMask)
+        {
+            return true;
+        }
+    }
+
+    return Unit::IsImmuneToSpell(spellInfo, castOnSelf);
+}
+
+/**
+ * @brief Checks whether the creature is immune to incoming damage school masks.
+ *
+ * @param meleeSchoolMask The damage school mask.
+ * @return true if the creature is immune; otherwise, false.
+ */
+bool Creature::IsImmuneToDamage(SpellSchoolMask meleeSchoolMask)
+{
+    if (GetCreatureInfo()->SchoolImmuneMask & meleeSchoolMask)
+    {
+        return true;
+    }
+
+    return Unit::IsImmuneToDamage(meleeSchoolMask);
+}
+
+/**
+ * @brief Checks whether the creature is immune to a specific spell effect.
+ *
+ * @param spellInfo The spell being evaluated.
+ * @param index The effect index.
+ * @param castOnSelf true if the spell is self-cast.
+ * @return true if the effect is immune; otherwise, false.
+ */
+bool Creature::IsImmuneToSpellEffect(SpellEntry const* spellInfo, SpellEffectIndex index, bool castOnSelf) const
+{
+    if (!castOnSelf && GetCreatureInfo()->MechanicImmuneMask & (1 << (spellInfo->EffectMechanic[index] - 1)))
+    {
+        return true;
+    }
+
+    // Taunt immunity special flag check
+    if (GetCreatureInfo()->ExtraFlags & CREATURE_FLAG_EXTRA_NOT_TAUNTABLE)
+    {
+        // Taunt aura apply check
+        if (spellInfo->Effect[index] == SPELL_EFFECT_APPLY_AURA)
+        {
+            if (spellInfo->EffectAura[index] == SPELL_AURA_MOD_TAUNT)
+            {
+                return true;
+            }
+        }
+        // Spell effect taunt check
+        else if (spellInfo->Effect[index] == SPELL_EFFECT_ATTACK_ME)
+        {
+            return true;
+        }
+    }
+
+    return Unit::IsImmuneToSpellEffect(spellInfo, index, castOnSelf);
+}
+
+/**
+ * @brief Finds an offensive spell that can currently reach a victim.
+ *
+ * @param pVictim The target unit.
+ * @return A usable offensive spell entry, or null if none fit.
+ */
+SpellEntry const* Creature::ReachWithSpellAttack(Unit* pVictim)
+{
+    if (!pVictim)
+    {
+        return NULL;
+    }
+
+    for (uint32 i = 0; i < CREATURE_MAX_SPELLS; ++i)
+    {
+        if (!m_spells[i])
+        {
+            continue;
+        }
+        SpellEntry const* spellInfo = sSpellStore.LookupEntry(m_spells[i]);
+        if (!spellInfo)
+        {
+            sLog.outError("WORLD: unknown spell id %i", m_spells[i]);
+            continue;
+        }
+
+        bool bcontinue = true;
+        for (int j = 0; j < MAX_EFFECT_INDEX; ++j)
+        {
+            if ((spellInfo->Effect[j] == SPELL_EFFECT_SCHOOL_DAMAGE)       ||
+                (spellInfo->Effect[j] == SPELL_EFFECT_INSTAKILL)            ||
+                (spellInfo->Effect[j] == SPELL_EFFECT_ENVIRONMENTAL_DAMAGE) ||
+                (spellInfo->Effect[j] == SPELL_EFFECT_HEALTH_LEECH)
+               )
+            {
+                bcontinue = false;
+                break;
+            }
+        }
+        if (bcontinue)
+        {
+            continue;
+        }
+
+        if (spellInfo->ManaCost > GetPower(POWER_MANA))
+        {
+            continue;
+        }
+        SpellRangeEntry const* srange = sSpellRangeStore.LookupEntry(spellInfo->RangeIndex);
+        float range = GetSpellMaxRange(srange);
+        float minrange = GetSpellMinRange(srange);
+
+        float dist = CombatDistanceBetween(*this, *pVictim, spellInfo->RangeIndex == SPELL_RANGE_IDX_COMBAT);
+
+        // if (!InFrontPhased(*this, *pVictim, range, M_PI_F) && spellInfo->AttributesEx )
+        //    continue;
+        if (dist > range || dist < minrange)
+        {
+            continue;
+        }
+        if (spellInfo->PreventionType == SPELL_PREVENTION_TYPE_SILENCE && HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SILENCED))
+        {
+            continue;
+        }
+        if (spellInfo->PreventionType == SPELL_PREVENTION_TYPE_PACIFY && HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PACIFIED))
+        {
+            continue;
+        }
+        return spellInfo;
+    }
+    return NULL;
+}
+
+/**
+ * @brief Finds a healing spell that can currently reach a target.
+ *
+ * @param pVictim The target unit.
+ * @return A usable healing spell entry, or null if none fit.
+ */
+SpellEntry const* Creature::ReachWithSpellCure(Unit* pVictim)
+{
+    if (!pVictim)
+    {
+        return NULL;
+    }
+
+    for (uint32 i = 0; i < CREATURE_MAX_SPELLS; ++i)
+    {
+        if (!m_spells[i])
+        {
+            continue;
+        }
+        SpellEntry const* spellInfo = sSpellStore.LookupEntry(m_spells[i]);
+        if (!spellInfo)
+        {
+            sLog.outError("WORLD: unknown spell id %i", m_spells[i]);
+            continue;
+        }
+
+        bool bcontinue = true;
+        for (int j = 0; j < MAX_EFFECT_INDEX; ++j)
+        {
+            if ((spellInfo->Effect[j] == SPELL_EFFECT_HEAL))
+            {
+                bcontinue = false;
+                break;
+            }
+        }
+        if (bcontinue)
+        {
+            continue;
+        }
+
+        if (spellInfo->ManaCost > GetPower(POWER_MANA))
+        {
+            continue;
+        }
+        SpellRangeEntry const* srange = sSpellRangeStore.LookupEntry(spellInfo->RangeIndex);
+        float range = GetSpellMaxRange(srange);
+        float minrange = GetSpellMinRange(srange);
+
+        float dist = CombatDistanceBetween(*this, *pVictim, spellInfo->RangeIndex == SPELL_RANGE_IDX_COMBAT);
+
+        // if (!InFrontPhased(*this, *pVictim, range, M_PI_F) && spellInfo->AttributesEx )
+        //    continue;
+        if (dist > range || dist < minrange)
+        {
+            continue;
+        }
+        if (spellInfo->PreventionType == SPELL_PREVENTION_TYPE_SILENCE && HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SILENCED))
+        {
+            continue;
+        }
+        if (spellInfo->PreventionType == SPELL_PREVENTION_TYPE_PACIFY && HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PACIFIED))
+        {
+            continue;
+        }
+        return spellInfo;
+    }
+    return NULL;
+}
+
+/**
+ * @brief Checks whether the creature should be visible in a player's grid.
+ *
+ * @param pl The observing player.
+ * @return true if visible; otherwise, false.
+ */
+bool Creature::IsVisibleInGridForPlayer(Player* pl) const
+{
+    // gamemaster in GM mode see all, including ghosts
+    if (pl->isGameMaster())
+    {
+        return true;
+    }
+
+    if (GetCreatureInfo()->ExtraFlags & CREATURE_FLAG_EXTRA_INVISIBLE)
+    {
+        return false;
+    }
+
+    // Live player (or with not release body see live creatures or death creatures with corpse disappearing time > 0
+    if (pl->IsAlive() || pl->GetDeathTimer() > 0)
+    {
+        return (IsAlive() || m_corpseRemoveTime > time(NULL) || (m_IsDeadByDefault && m_deathState == CORPSE));
+    }
+
+    // Dead player see live creatures near own corpse
+    if (IsAlive())
+    {
+        Corpse* corpse = pl->GetCorpse();
+        if (corpse)
+        {
+            // 20 - aggro distance for same level, 25 - max additional distance if player level less that creature level
+            if (InReach(*corpse, *this, (20 + 25)*sWorld.getConfig(CONFIG_FLOAT_RATE_CREATURE_AGGRO)))
+            {
+                return true;
+            }
+        }
+    }
+
+    // Dead player can see ghosts
+    if (GetCreatureInfo()->CreatureTypeFlags & CREATURE_TYPEFLAGS_GHOST_VISIBLE)
+    {
+        return true;
+    }
+
+    // and not see any other
+    return false;
+}
+
+/**
+ * @brief Sends an AI reaction packet to nearby players.
+ *
+ * @param reactionType The reaction type to send.
+ */
+void Creature::SendAIReaction(AiReaction reactionType)
+{
+    WorldPacket data(SMSG_AI_REACTION, 12);
+
+    data << GetObjectGuid();
+    data << uint32(reactionType);
+
+    ((WorldObject*)this)->SendMessageToSet(&data, true);
+
+    DEBUG_FILTER_LOG(LOG_FILTER_AI_AND_MOVEGENSS, "WORLD: Sent SMSG_AI_REACTION, type %u.", reactionType);
+}
+
+/**
+ * @brief Requests assistance from nearby allied AI when entering combat.
+ */
+void Creature::CallAssistance()
+{
+    // FIXME: should player pets call for assistance?
+    if (!m_AlreadyCallAssistance && getVictim() && !IsCharmed())
+    {
+        SetNoCallAssistance(true);
+
+        if (GetCreatureInfo()->ExtraFlags & CREATURE_FLAG_EXTRA_NO_CALL_ASSIST)
+        {
+            return;
+        }
+
+        AI()->SendAIEventAround(AI_EVENT_CALL_ASSISTANCE, getVictim(), sWorld.getConfig(CONFIG_UINT32_CREATURE_FAMILY_ASSISTANCE_DELAY), sWorld.getConfig(CONFIG_FLOAT_CREATURE_FAMILY_ASSISTANCE_RADIUS));
+    }
+}
+
+/**
+ * @brief Calls nearby creatures for direct help within a radius.
+ *
+ * @param fRadius The assistance radius.
+ */
+void Creature::CallForHelp(float fRadius)
+{
+    if (fRadius <= 0.0f || !getVictim() || IsPet() || IsCharmed())
+    {
+        return;
+    }
+
+    MaNGOS::CallOfHelpCreatureInRangeDo u_do(this, getVictim(), fRadius);
+    MaNGOS::CreatureWorker<MaNGOS::CallOfHelpCreatureInRangeDo> worker(u_do);
+    Cell::VisitGridObjects(this, worker, fRadius);
+}
+
+/// if enemy provided, check for initial combat help against enemy
+/**
+ * @brief Checks whether this creature may assist another unit against an enemy.
+ *
+ * @param u The allied unit requesting assistance.
+ * @param enemy Optional enemy unit.
+ * @param checkfaction true to require matching faction ids.
+ * @return true if assistance is allowed; otherwise, false.
+ */
+bool Creature::CanAssistTo(const Unit* u, const Unit* enemy, bool checkfaction /*= true*/) const
+{
+    // we don't need help from zombies :)
+    if (!IsAlive())
+    {
+        return false;
+    }
+
+    // we don't need help from non-combatant ;)
+    if (IsCivilian())
+    {
+        return false;
+    }
+
+    if (HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_NOT_SELECTABLE | UNIT_FLAG_PASSIVE))
+    {
+        return false;
+    }
+
+    // skip fighting creature
+    if (enemy && IsInCombat())
+    {
+        return false;
+    }
+
+    // only free creature
+    if (GetCharmerOrOwnerGuid())
+    {
+        return false;
+    }
+
+    // only from same creature faction
+    if (checkfaction)
+    {
+        if (getFaction() != u->getFaction())
+        {
+            return false;
+        }
+    }
+    else
+    {
+        if (!IsFriendlyTo(u))
+        {
+            return false;
+        }
+    }
+
+    // skip non hostile to caster enemy creatures
+    if (enemy && !IsHostileTo(enemy))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Checks whether the creature may start an attack right now.
+ *
+ * @return true if attacks may be initiated; otherwise, false.
+ */
+bool Creature::CanInitiateAttack()
+{
+    if (hasUnitState(UNIT_STAT_STUNNED | UNIT_STAT_DIED))
+    {
+        return false;
+    }
+
+    if (HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_NOT_SELECTABLE))
+    {
+        return false;
+    }
+
+    if (isPassiveToHostile())
+    {
+        return false;
+    }
+
+    if (m_aggroDelay != 0)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Saves the creature respawn time to persistent state when needed.
+ */
+void Creature::SaveRespawnTime()
+{
+    if (IsPet() || !HasStaticDBSpawnData())
+    {
+        return;
+    }
+
+    if (m_respawnTime > time(NULL))                         // dead (no corpse)
+    {
+        GetMap()->GetPersistentState()->SaveCreatureRespawnTime(GetGUIDLow(), m_respawnTime);
+    }
+    else if (m_corpseRemoveTime > time(NULL))               // dead (corpse)
+    {
+        GetMap()->GetPersistentState()->SaveCreatureRespawnTime(GetGUIDLow(), m_corpseRemoveTime + m_respawnDelay);
+    }
+}
+
+/**
+ * @brief Checks whether a victim has moved outside the threat area.
+ *
+ * @param pVictim The victim to test.
+ * @return true if the victim is outside threat area; otherwise, false.
+ */
+bool Creature::IsOutOfThreatArea(Unit* pVictim) const
+{
+    if (!pVictim)
+    {
+        return true;
+    }
+
+    if (!pVictim->Where().ShareFrame(this->Where()))
+    {
+        return true;
+    }
+
+    if (!pVictim->IsTargetableForAttack())
+    {
+        return true;
+    }
+
+    if (!pVictim->isInAccessablePlaceFor(this))
+    {
+        return true;
+    }
+
+    if (!pVictim->IsVisibleForOrDetect(this, this, false))
+    {
+        return true;
+    }
+
+    if (sMapStore.LookupEntry(GetMapId())->IsDungeon())
+    {
+        return false;
+    }
+
+    float AttackDist = GetAttackDistance(pVictim);
+    float ThreatRadius = sWorld.getConfig(CONFIG_FLOAT_THREAT_RADIUS);
+
+    // Use AttackDistance in distance check if threat radius is lower. This prevents creature bounce in and out of combat every update tick.
+    return !pVictim->Where().WithinDist(CombatAnchor(), ThreatRadius > AttackDist ? ThreatRadius : AttackDist);
+}
+
+/**
+ * @brief Gets addon data for this creature instance or template.
+ *
+ * @return The addon data, or null if none exists.
+ */
+CreatureDataAddon const* Creature::GetCreatureAddon() const
+{
+    if (CreatureDataAddon const* addon = ObjectMgr::GetCreatureAddon(GetGUIDLow()))
+    {
+        return addon;
+    }
+
+    // dependent from difficulty mode entry
+    if (GetEntry() != GetCreatureInfo()->Entry)
+    {
+        // If CreatureTemplateAddon for heroic exist, it's there for a reason
+        if (CreatureDataAddon const* addon =  ObjectMgr::GetCreatureTemplateAddon(GetCreatureInfo()->Entry))
+        {
+            return addon;
+        }
+    }
+
+    // Return CreatureTemplateAddon when nothing else exist
+    return ObjectMgr::GetCreatureTemplateAddon(GetEntry());
+}
+
+// creature_addon table
+/**
+ * @brief Loads creature addon data such as mount, bytes, emote, and auras.
+ *
+ * @param reload true when reloading addon state after respawn.
+ * @return true if addon data existed and was applied; otherwise, false.
+ */
+bool Creature::LoadCreatureAddon(bool reload)
+{
+    CreatureDataAddon const* cainfo = GetCreatureAddon();
+    if (!cainfo)
+    {
+        return false;
+    }
+
+    if (cainfo->mount != 0)
+    {
+        Mount(cainfo->mount);
+    }
+
+    if (cainfo->bytes1 != 0)
+    {
+        // 0 StandState
+        // 1 LoyaltyLevel  Pet only, so always 0 for default creature
+        // 2 StandFlags
+        // 3 StandMiscFlags
+
+        SetByteValue(UNIT_FIELD_BYTES_1, 0, uint8(cainfo->bytes1 & 0xFF));
+        SetByteValue(UNIT_FIELD_BYTES_1, 1, 0);
+        SetByteValue(UNIT_FIELD_BYTES_1, 2, uint8((cainfo->bytes1 >> 16) & 0xFF));
+        SetByteValue(UNIT_FIELD_BYTES_1, 3, uint8((cainfo->bytes1 >> 24) & 0xFF));
+    }
+
+    // UNIT_FIELD_BYTES_2
+    // 0 SheathState
+    // 1 Bytes2Flags, in 3.x used UnitPVPStateFlags, that have different meaning
+    // 2 UnitRename         Pet only, so always 0 for default creature
+    // 3 ShapeshiftForm     Must be determined/set by shapeshift spell/aura
+    SetByteValue(UNIT_FIELD_BYTES_2, 0, cainfo->sheath_state);
+
+    if (cainfo->flags != 0)
+    {
+        SetByteValue(UNIT_FIELD_BYTES_2, 1, cainfo->flags);
+    }
+
+    // SetByteValue(UNIT_FIELD_BYTES_2, 2, 0);
+    // SetByteValue(UNIT_FIELD_BYTES_2, 3, 0);
+
+    if (cainfo->emote != 0)
+    {
+        SetUInt32Value(UNIT_NPC_EMOTESTATE, cainfo->emote);
+    }
+
+    if (cainfo->auras)
+    {
+        for (uint32 const* cAura = cainfo->auras; *cAura; ++cAura)
+        {
+            if (HasAura(*cAura))
+            {
+                if (!reload)
+                {
+                    sLog.outErrorDb("Creature (GUIDLow: %u Entry: %u) has spell %u in `auras` field, but aura is already applied.", GetGUIDLow(), GetEntry(), *cAura);
+                }
+
+                continue;
+            }
+
+            CastSpell(this, *cAura, true);
+        }
+    }
+    return true;
+}
+
+/// Sends a message to LocalDefense and WorldDefense channels for players of the other team
+/**
+ * @brief Sends a zone-under-attack message for the opposing team.
+ *
+ * @param attacker The player who triggered the warning.
+ */
+void Creature::SendZoneUnderAttackMessage(Player* attacker)
+{
+    sWorld.SendZoneUnderAttackMessage(GetTerrain()->GetZoneId(Where().X(), Where().Y(), Where().Z()), attacker->GetTeam() == ALLIANCE ? HORDE : ALLIANCE);
+}
+
+/**
+ * @brief Sets this creature in combat with all hostile players in the instance.
+ */
+void Creature::SetInCombatWithZone()
+{
+    if (!CanHaveThreatList())
+    {
+        sLog.outError("Creature entry %u call SetInCombatWithZone but creature can not have threat list.", GetEntry());
+        return;
+    }
+
+    Map* pMap = GetMap();
+
+    if (!pMap->IsDungeon())
+    {
+        sLog.outError("Creature entry %u call SetInCombatWithZone for map (id: %u) that isn't an instance.", GetEntry(), pMap->GetId());
+        return;
+    }
+
+    Map::PlayerList const& PlList = pMap->GetPlayers();
+
+    if (PlList.isEmpty())
+    {
+        return;
+    }
+
+    for (Map::PlayerList::const_iterator i = PlList.begin(); i != PlList.end(); ++i)
+    {
+        if (Player* pPlayer = i->getSource())
+        {
+            if (pPlayer->isGameMaster())
+            {
+                continue;
+            }
+
+            if (pPlayer->IsAlive() && !IsFriendlyTo(pPlayer))
+            {
+                pPlayer->SetInCombatWith(this);
+                AddThreat(pPlayer);
+            }
+        }
+    }
+}
+
+/**
+ * @brief Checks whether a target satisfies selection requirements for attacking or casting.
+ *
+ * @param pTarget The candidate target.
+ * @param pSpellInfo Optional spell context.
+ * @param selectFlags Target selection flags.
+ * @return true if the target matches the requirements; otherwise, false.
+ */
+bool Creature::MeetsSelectAttackingRequirement(Unit* pTarget, SpellEntry const* pSpellInfo, uint32 selectFlags) const
+{
+    if (selectFlags & SELECT_FLAG_PLAYER && pTarget->GetTypeId() != TYPEID_PLAYER)
+    {
+        return false;
+    }
+
+    if (selectFlags & SELECT_FLAG_POWER_MANA && pTarget->GetPowerType() != POWER_MANA)
+    {
+        return false;
+    }
+    else if (selectFlags & SELECT_FLAG_POWER_RAGE && pTarget->GetPowerType() != POWER_RAGE)
+    {
+        return false;
+    }
+    else if (selectFlags & SELECT_FLAG_POWER_ENERGY && pTarget->GetPowerType() != POWER_ENERGY)
+    {
+        return false;
+    }
+
+    if (selectFlags & SELECT_FLAG_IN_MELEE_RANGE && !InMeleeReach(*this, *pTarget))
+    {
+        return false;
+    }
+    if (selectFlags & SELECT_FLAG_NOT_IN_MELEE_RANGE && InMeleeReach(*this, *pTarget))
+    {
+        return false;
+    }
+
+    if (pSpellInfo && selectFlags & SELECT_FLAG_IN_LOS && !DisableMgr::IsDisabledFor(DISABLE_TYPE_SPELL, pSpellInfo->ID, pTarget, SPELL_DISABLE_LOS) && !HasLineOfSight(*this, *pTarget))
+    {
+        return false;
+    }
+
+    if (pSpellInfo)
+    {
+        switch (pSpellInfo->RangeIndex)
+        {
+            case SPELL_RANGE_IDX_SELF_ONLY: return false;
+            case SPELL_RANGE_IDX_ANYWHERE:  return true;
+            case SPELL_RANGE_IDX_COMBAT:    return InMeleeReach(*this, *pTarget);
+        }
+
+        SpellRangeEntry const* srange = sSpellRangeStore.LookupEntry(pSpellInfo->RangeIndex);
+        float max_range = GetSpellMaxRange(srange);
+        float min_range = GetSpellMinRange(srange);
+        float dist = CombatDistanceBetween(*this, *pTarget, false);
+
+        return dist < max_range && dist >= min_range;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Selects an attacking target using a spell id for range checks.
+ *
+ * @param target The target-selection mode.
+ * @param position The position offset within the threat list.
+ * @param uiSpellEntry Optional spell id context.
+ * @param selectFlags Target selection flags.
+ * @return The selected unit, or null if none matched.
+ */
+Unit* Creature::SelectAttackingTarget(AttackingTarget target, uint32 position, uint32 uiSpellEntry, uint32 selectFlags) const
+{
+    return SelectAttackingTarget(target, position, sSpellStore.LookupEntry(uiSpellEntry), selectFlags);
+}
+
+/**
+ * @brief Selects an attacking target from the threat list.
+ *
+ * @param target The target-selection mode.
+ * @param position The position offset within the threat list.
+ * @param pSpellInfo Optional spell context.
+ * @param selectFlags Target selection flags.
+ * @return The selected unit, or null if none matched.
+ */
+Unit* Creature::SelectAttackingTarget(AttackingTarget target, uint32 position, SpellEntry const* pSpellInfo /*= NULL*/, uint32 selectFlags/*= 0*/) const
+{
+    if (!CanHaveThreatList())
+    {
+        return NULL;
+    }
+
+    // ThreatList m_threatlist;
+    ThreatList const& threatlist = GetThreatManager().getThreatList();
+    ThreatList::const_iterator itr = threatlist.begin();
+    ThreatList::const_reverse_iterator ritr = threatlist.rbegin();
+
+    if (position >= threatlist.size() || !threatlist.size())
+    {
+        return NULL;
+    }
+
+    switch (target)
+    {
+        case ATTACKING_TARGET_RANDOM:
+        {
+            std::vector<Unit*> suitableUnits;
+            suitableUnits.reserve(threatlist.size() - position);
+            advance(itr, position);
+            for (; itr != threatlist.end(); ++itr)
+            {
+                if (Unit* pTarget = GetMap()->GetUnit((*itr)->getUnitGuid()))
+                    if (!selectFlags || MeetsSelectAttackingRequirement(pTarget, pSpellInfo, selectFlags))
+                    {
+                        suitableUnits.push_back(pTarget);
+                    }
+            }
+
+            if (!suitableUnits.empty())
+            {
+                return suitableUnits[urand(0, suitableUnits.size() - 1)];
+            }
+
+            break;
+        }
+        case ATTACKING_TARGET_TOPAGGRO:
+        {
+            advance(itr, position);
+            for (; itr != threatlist.end(); ++itr)
+            {
+                if (Unit* pTarget = GetMap()->GetUnit((*itr)->getUnitGuid()))
+                    if (!selectFlags || MeetsSelectAttackingRequirement(pTarget, pSpellInfo, selectFlags))
+                    {
+                        return pTarget;
+                    }
+            }
+
+            break;
+        }
+        case ATTACKING_TARGET_BOTTOMAGGRO:
+        {
+            advance(ritr, position);
+            for (; ritr != threatlist.rend(); ++ritr)
+            {
+                if (Unit* pTarget = GetMap()->GetUnit((*itr)->getUnitGuid()))
+                    if (!selectFlags || MeetsSelectAttackingRequirement(pTarget, pSpellInfo, selectFlags))
+                    {
+                        return pTarget;
+                    }
+            }
+
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+
+
+
+
+
+
+/**
+ * @brief Checks whether the creature is currently evading back home.
+ *
+ * @return true if the home movement generator is active; otherwise, false.
+ */
+bool Creature::IsInEvadeMode() const
+{
+    return !i_motionMaster.empty() && i_motionMaster.GetCurrentMovementGeneratorType() == HOME_MOTION_TYPE;
+}
+
+/**
+ * @brief Checks whether the creature knows a specific spell.
+ *
+ * @param spellID The spell identifier.
+ * @return true if the spell is present in the creature spell list; otherwise, false.
+ */
+bool Creature::HasSpell(uint32 spellID) const
+{
+    uint8 i;
+    for (i = 0; i < CREATURE_MAX_SPELLS; ++i)
+    {
+        if (spellID == m_spells[i])
+        {
+            break;
+        }
+    }
+    return i < CREATURE_MAX_SPELLS;                         // break before end of iteration of known spells
+}
+
+/**
+ * @brief Gets the effective respawn time, accounting for corpse decay.
+ *
+ * @return The next respawn-related time value.
+ */
+time_t Creature::GetRespawnTimeEx() const
+{
+    time_t now = time(NULL);
+    if (m_respawnTime > now)                                // dead (no corpse)
+    {
+        return m_respawnTime;
+    }
+    else if (m_corpseRemoveTime > time(NULL))               // dead (corpse)
+    {
+        return m_corpseRemoveTime + m_respawnDelay;
+    }
+    else
+    {
+        return now;
+    }
+}
+
+/**
+ * @brief Gets the stored respawn coordinates and optional orientation/radius.
+ *
+ * @param x Receives the respawn x coordinate.
+ * @param y Receives the respawn y coordinate.
+ * @param z Receives the respawn z coordinate.
+ * @param ori Optional orientation output.
+ * @param dist Optional respawn radius output.
+ */
+/**
+ * @brief Put the creature back where it belongs.
+ *
+ * The respawn coord is not always a place on the map. A crew member's home is a DECK
+ * OFFSET -- it was set from `creature_transport` and it was never world data -- so sending
+ * it through CreatureRelocation would read the offset as a map coordinate and file the
+ * creature into the grid cell a few yards from the map origin. Exactly the trap that
+ * Unit::UpdateSplineMovement sets, and it is sprung by any crew member that simply dies.
+ *
+ * So the one operation "go home" is resolved once, here, in whichever world the creature
+ * actually lives in.
+ */
+void Creature::RelocateToRespawnPoint()
+{
+    const Geometry::Vector3 home = Spawn().Pos();
+    const float x = home.x, y = home.y, z = home.z, o = Spawn().Facing();
+
+    // Aboard, the respawn coord is already a place on the vessel's own map, because that
+    // map is the only frame anything on a deck has ever been expressed in. So this is one
+    // relocation, on whichever map the creature is on, and nothing has to know which.
+    GetMap()->CreatureRelocation(this, x, y, z, o);
+}
+
+void Creature::SetSpawn(CreatureCreatePos const& pos)
+{
+    SetSpawn(Geometry::Vector3(pos.m_pos.x, pos.m_pos.y, pos.m_pos.z), pos.m_pos.o);
+}
+
+void Creature::SetSpawn(Geometry::Vector3 const& at, float facing)
+{
+    m_spawn.EnterFrame(Where().CurrentFrame(), at, facing);
+
+    MANGOS_ASSERT(MaNGOS::IsValidMapCoord(at.x, at.y, at.z) ||
+                  PrintCoordinatesError(at.x, at.y, at.z, "respawn"));
+}
+
+void Creature::ResetSpawn()
+{
+    if (CreatureData const* data = sObjectMgr.GetCreatureData(GetGUIDLow()))
+    {
+        SetSpawn(Geometry::Vector3(data->posX, data->posY, data->posZ), data->orientation);
+    }
+}
+
+/**
+ * @brief Handles corpse state after all loot has been removed.
+ */
+void Creature::AllLootRemovedFromCorpse()
+{
+    if (loot.loot_type != LOOT_SKINNING && !IsPet() && GetCreatureInfo()->LootId && GetLootRecipient())
+    {
+        if (LootTemplates_Skinning.HaveLootFor(GetCreatureInfo()->LootId))
+        {
+            // Check for Skinning Loot, and set flag is loot exists
+            if (!lootForSkin)
+            {
+                HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SKINNABLE);
+            }
+        }
+    }
+
+    time_t now = time(NULL);
+    if (m_corpseRemoveTime <= now)
+    {
+        return;
+    }
+
+    float decayRate = sWorld.getConfig(CONFIG_FLOAT_RATE_CORPSE_DECAY_LOOTED);
+
+    // corpse skinnable, but without skinning flag, and then skinned, corpse will despawn next update
+    if (loot.loot_type == LOOT_SKINNING)
+    {
+        m_corpseRemoveTime = now;
+    }
+    else
+    {
+        m_corpseRemoveTime = now + uint32(m_corpseDelay * decayRate);
+    }
+
+    m_respawnTime = m_corpseRemoveTime + m_respawnDelay;
+}
+
+/**
+ * @brief Gets the creature level as perceived by a target.
+ *
+ * @param target The unit viewing the creature.
+ * @return The effective creature level for that target.
+ */
+uint32 Creature::GetLevelForTarget(Unit const* target) const
+{
+    if (!IsWorldBoss())
+    {
+        return Unit::GetLevelForTarget(target);
+    }
+
+    uint32 level = target->getLevel() + sWorld.getConfig(CONFIG_UINT32_WORLD_BOSS_LEVEL_DIFF);
+    if (level < 1)
+    {
+        return 1;
+    }
+    if (level > 255)
+    {
+        return 255;
+    }
+    return level;
+}
+
+/**
+ * @brief Gets the configured AI name for this creature entry.
+ *
+ * @return The AI name string.
+ */
+std::string Creature::GetAIName() const
+{
+    return ObjectMgr::GetCreatureTemplate(GetEntry())->AIName;
+}
+
+/**
+ * @brief Gets the script name bound to this creature.
+ *
+ * @return The script name string.
+ */
+std::string Creature::GetScriptName() const
+{
+    return sScriptMgr.GetScriptName(GetScriptId());
+}
+
+/**
+ * @brief Gets the bound script identifier for this creature.
+ *
+ * @return The script identifier.
+ */
+uint32 Creature::GetScriptId() const
+{
+    // scripts bound to DB guid have priority over ones bound to creature entry
+    return sScriptMgr.GetBoundScriptId(SCRIPTED_UNIT, -int32(GetGUIDLow())) ? sScriptMgr.GetBoundScriptId(SCRIPTED_UNIT, -int32(GetGUIDLow())) : sScriptMgr.GetBoundScriptId(SCRIPTED_UNIT, GetEntry());
+}
+
+
+
+
+
+
+
+// overwrite WorldObject function for proper name localization
+/**
+ * @brief Gets the localized creature name for a locale index.
+ *
+ * @param loc_idx The locale index.
+ * @return The localized name, or the default name if unavailable.
+ */
+const char* Creature::GetNameForLocaleIdx(int32 loc_idx) const
+{
+    char const* name = GetName();
+    sObjectMgr.GetCreatureLocaleStrings(GetEntry(), loc_idx, &name);
+    return name;
+}
+
+/**
+ * @brief Applies a temporary faction and associated flag toggles.
+ *
+ * @param factionId The temporary faction id.
+ * @param tempFactionFlags The temporary faction behavior flags.
+ */
+void Creature::SetFactionTemporary(uint32 factionId, uint32 tempFactionFlags)
+{
+    m_temporaryFactionFlags = tempFactionFlags;
+    setFaction(factionId);
+
+    if (m_temporaryFactionFlags & TEMPFACTION_TOGGLE_NON_ATTACKABLE)
+    {
+        RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NON_ATTACKABLE);
+    }
+    if (m_temporaryFactionFlags & TEMPFACTION_TOGGLE_OOC_NOT_ATTACK)
+    {
+        RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_OOC_NOT_ATTACKABLE);
+    }
+    if (m_temporaryFactionFlags & TEMPFACTION_TOGGLE_PASSIVE)
+    {
+        RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PASSIVE);
+    }
+    if (m_temporaryFactionFlags & TEMPFACTION_TOGGLE_PACIFIED)
+    {
+        RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PACIFIED);
+    }
+    if (m_temporaryFactionFlags & TEMPFACTION_TOGGLE_NOT_SELECTABLE)
+    {
+        RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NOT_SELECTABLE);
+    }
+}
+
+/**
+ * @brief Restores the original faction and temporary flags after a temporary change.
+ */
+void Creature::ClearTemporaryFaction()
+{
+    // No restore if creature is charmed/possessed.
+    // For later we may consider extend to restore to charmer faction where charmer is creature.
+    // This can also be done by update any pet/charmed of creature at any faction change to charmer.
+    if (IsCharmed())
+    {
+        return;
+    }
+
+    // Reset to original faction
+    setFaction(GetCreatureInfo()->FactionAlliance);
+    // Reset UNIT_FLAG_NON_ATTACKABLE, UNIT_FLAG_OOC_NOT_ATTACKABLE, UNIT_FLAG_PASSIVE, UNIT_FLAG_PACIFIED or UNIT_FLAG_NOT_SELECTABLE flags
+    if (m_temporaryFactionFlags & TEMPFACTION_TOGGLE_NON_ATTACKABLE && GetCreatureInfo()->UnitFlags & UNIT_FLAG_NON_ATTACKABLE)
+    {
+        SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NON_ATTACKABLE);
+    }
+    if (m_temporaryFactionFlags & TEMPFACTION_TOGGLE_OOC_NOT_ATTACK && GetCreatureInfo()->UnitFlags & UNIT_FLAG_OOC_NOT_ATTACKABLE && !IsInCombat())
+    {
+        SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_OOC_NOT_ATTACKABLE);
+    }
+    if (m_temporaryFactionFlags & TEMPFACTION_TOGGLE_PASSIVE && GetCreatureInfo()->UnitFlags & UNIT_FLAG_PASSIVE)
+    {
+        SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PASSIVE);
+    }
+    if (m_temporaryFactionFlags & TEMPFACTION_TOGGLE_PACIFIED && GetCreatureInfo()->UnitFlags & UNIT_FLAG_PACIFIED)
+    {
+        SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PACIFIED);
+    }
+    if (m_temporaryFactionFlags & TEMPFACTION_TOGGLE_NOT_SELECTABLE && GetCreatureInfo()->UnitFlags & UNIT_FLAG_NOT_SELECTABLE)
+    {
+        SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NOT_SELECTABLE);
+    }
+
+    m_temporaryFactionFlags = TEMPFACTION_NONE;
+}
+
+/**
+ * @brief Sends the spirit healer timer query response to a player.
+ *
+ * @param pl The player receiving the response.
+ */
+void Creature::SendAreaSpiritHealerQueryOpcode(Player* pl)
+{
+    uint32 next_resurrect = 0;
+    if (Spell* pcurSpell = GetCurrentSpell(CURRENT_CHANNELED_SPELL))
+    {
+        next_resurrect = pcurSpell->GetCastedTime();
+    }
+    WorldPacket data(SMSG_AREA_SPIRIT_HEALER_TIME, 8 + 4);
+    data << ObjectGuid(GetObjectGuid());
+    data << uint32(next_resurrect);
+    pl->SendDirectMessage(&data);
+}
+
+/**
+ * @brief Applies or removes game-event startup and shutdown spells for this creature.
+ *
+ * @param eventData The active game event creature data.
+ * @param activated true when the event is activating; false when it is ending.
+ */
+void Creature::ApplyGameEventSpells(GameEventCreatureData const* eventData, bool activated)
+{
+    uint32 cast_spell = activated ? eventData->spell_id_start : eventData->spell_id_end;
+    uint32 remove_spell = activated ? eventData->spell_id_end : eventData->spell_id_start;
+
+    if (remove_spell)
+        if (SpellEntry const* spellEntry = sSpellStore.LookupEntry(remove_spell))
+            if (IsSpellAppliesAura(spellEntry))
+            {
+                RemoveAurasDueToSpell(remove_spell);
+            }
+
+    if (cast_spell)
+    {
+        CastSpell(this, cast_spell, true);
+    }
+}
+
+/**
+ * @brief Appends GUIDs from the creature's threat list to an output vector.
+ *
+ * @param guids The output GUID vector.
+ * @param maxamount Optional maximum number of GUIDs to append.
+ */
+void Creature::FillGuidsListFromThreatList(GuidVector& guids, uint32 maxamount /*= 0*/)
+{
+    if (!CanHaveThreatList())
+    {
+        return;
+    }
+
+    ThreatList const& threats = GetThreatManager().getThreatList();
+
+    maxamount = maxamount > 0 ? std::min(maxamount, uint32(threats.size())) : threats.size();
+
+    guids.reserve(guids.size() + maxamount);
+
+    for (ThreatList::const_iterator itr = threats.begin(); maxamount && itr != threats.end(); ++itr, --maxamount)
+    {
+        guids.push_back((*itr)->getUnitGuid());
+    }
+}
+
+struct AddCreatureToRemoveListInMapsWorker
+{
+    AddCreatureToRemoveListInMapsWorker(ObjectGuid guid) : i_guid(guid) {}
+
+    void operator()(Map* map)
+    {
+        if (Creature* pCreature = map->GetCreature(i_guid))
+        {
+            pCreature->AddObjectToRemoveList();
+        }
+    }
+
+    ObjectGuid i_guid;
+};
+
+/**
+ * @brief Schedules matching spawned creatures for removal across loaded maps.
+ *
+ * @param db_guid The database GUID.
+ * @param data The static creature spawn data.
+ */
+void Creature::AddToRemoveListInMaps(uint32 db_guid, CreatureData const* data)
+{
+    AddCreatureToRemoveListInMapsWorker worker(data->GetObjectGuid(db_guid));
+    sMapMgr.DoForAllMapsWithMapId(data->mapid, worker);
+}
+
+struct SpawnCreatureInMapsWorker
+{
+    SpawnCreatureInMapsWorker(uint32 guid, CreatureData const* data) : i_guid(guid), i_data(data) {}
+
+    void operator()(Map* map)
+    {
+        // We use spawn coords to spawn
+        if (map->IsCellLoaded(i_data->posX, i_data->posY))
+        {
+            Creature* pCreature = new Creature;
+            if (!pCreature->LoadFromDB(i_guid, map))
+            {
+                delete pCreature;
+            }
+        }
+    }
+
+    uint32 i_guid;
+    CreatureData const* i_data;
+};
+
+/**
+ * @brief Spawns this database creature across eligible loaded maps.
+ *
+ * @param db_guid The database GUID.
+ * @param data The static creature spawn data.
+ */
+void Creature::SpawnInMaps(uint32 db_guid, CreatureData const* data)
+{
+    SpawnCreatureInMapsWorker worker(db_guid, data);
+    sMapMgr.DoForAllMapsWithMapId(data->mapid, worker);
+}
+
+/**
+ * @brief Checks whether this creature has static database spawn data.
+ *
+ * @return true if the creature has a saved DB spawn; otherwise, false.
+ */
+bool Creature::HasStaticDBSpawnData() const
+{
+    return sObjectMgr.GetCreatureData(GetGUIDLow()) != NULL;
+}
+
+/**
+ * @brief Sets a virtual equipment item from an item template entry.
+ *
+ * @param slot The virtual item slot.
+ * @param item_id The equipment template item id.
+ */
+void Creature::SetVirtualItem(VirtualItemSlot slot, uint32 item_id)
+{
+    if (item_id == 0)
+    {
+        SetUInt32Value(UNIT_VIRTUAL_ITEM_SLOT_DISPLAY + slot, 0);
+        SetUInt32Value(UNIT_VIRTUAL_ITEM_INFO + (slot * 2) + 0, 0);
+        SetUInt32Value(UNIT_VIRTUAL_ITEM_INFO + (slot * 2) + 1, 0);
+        return;
+    }
+
+    ItemPrototype const* proto = ObjectMgr::GetItemPrototype(item_id);
+    if (!proto)
+    {
+        sLog.outError("Not listed in 'item_template' item (ID:%u) used as virtual item for %s", item_id, GetGuidStr().c_str());
+        return;
+    }
+
+    SetUInt32Value(UNIT_VIRTUAL_ITEM_SLOT_DISPLAY + slot, proto->DisplayInfoID);
+    SetByteValue(UNIT_VIRTUAL_ITEM_INFO + (slot * 2) + 0, VIRTUAL_ITEM_INFO_0_OFFSET_CLASS,         proto->Class);
+    SetByteValue(UNIT_VIRTUAL_ITEM_INFO + (slot * 2) + 0, VIRTUAL_ITEM_INFO_0_OFFSET_SUBCLASS,      proto->SubClass);
+    SetByteValue(UNIT_VIRTUAL_ITEM_INFO + (slot * 2) + 0, VIRTUAL_ITEM_INFO_0_OFFSET_UNK0,     proto->Unk0);
+    SetByteValue(UNIT_VIRTUAL_ITEM_INFO + (slot * 2) + 0, VIRTUAL_ITEM_INFO_0_OFFSET_MATERIAL,      proto->Material);
+    SetByteValue(UNIT_VIRTUAL_ITEM_INFO + (slot * 2) + 1, VIRTUAL_ITEM_INFO_1_OFFSET_INVENTORYTYPE, proto->InventoryType);
+
+    SetByteValue(UNIT_VIRTUAL_ITEM_INFO + (slot * 2) + 1, VIRTUAL_ITEM_INFO_1_OFFSET_SHEATH,        proto->Sheath);
+}
+
+/**
+ * @brief Sets a virtual equipment item using raw display and info fields.
+ *
+ * @param slot The virtual item slot.
+ * @param display_id The display model id.
+ * @param info0 The first packed item info value.
+ * @param info1 The second packed item info value.
+ */
+void Creature::SetVirtualItemRaw(VirtualItemSlot slot, uint32 display_id, uint32 info0, uint32 info1)
+{
+    SetUInt32Value(UNIT_VIRTUAL_ITEM_SLOT_DISPLAY + slot, display_id);
+    SetUInt32Value(UNIT_VIRTUAL_ITEM_INFO + (slot * 2) + 0, info0);
+    SetUInt32Value(UNIT_VIRTUAL_ITEM_INFO + (slot * 2) + 1, info1);
+}
+
+
+
+
+
+
+
+

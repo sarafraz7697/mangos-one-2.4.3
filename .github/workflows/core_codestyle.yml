@@ -1,0 +1,28 @@
+name: Codestyle Checks
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master, united, devel]
+  pull_request:
+    branches: [master, united]
+
+concurrency:
+  group: codestyle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-codestyle:
+    strategy:
+      fail-fast: false
+
+    runs-on: ubuntu-latest
+    name: Check Codestyling
+    steps:
+      # v2 runs on a long-deprecated Node runtime.
+      - uses: actions/checkout@v4
+
+      - name: Check Codestyling
+        run: source ./.github/apps/ci/ci-codestyle.sh

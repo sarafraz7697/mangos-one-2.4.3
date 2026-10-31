@@ -1,0 +1,40 @@
+#
+# This code is part of MaNGOS. Contributor & Copyright details are in AUTHORS/THANKS.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+
+project(Detour VERSION 1.0.0)
+
+file(GLOB DTR_SOURCES Source/*.cpp)
+file(GLOB DTR_INCLUDES Include/*.h)
+
+add_library(Detour STATIC ${DTR_SOURCES} ${DTR_INCLUDES})
+add_library(RecastNavigation::Detour ALIAS Detour)
+
+target_include_directories(Detour
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/Include
+)
+
+target_compile_definitions(Detour
+    PUBLIC
+        DT_POLYREF64
+)
+
+set_target_properties(Detour
+    PROPERTIES
+        VERSION 1.0.0
+)

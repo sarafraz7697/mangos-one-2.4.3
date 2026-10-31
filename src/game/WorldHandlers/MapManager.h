@@ -1,0 +1,228 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * MaNGOS is a full featured server for World of Warcraft, supporting
+ * the following clients: 1.12.x, 2.4.3, 3.3.5a, 4.3.4a and 5.4.8
+ *
+ * Copyright (C) 2005-2026 MaNGOS <https://www.getmangos.eu>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * World of Warcraft, and all World of Warcraft or Warcraft art, images,
+ * and lore are copyrighted by Blizzard Entertainment, Inc.
+ */
+
+#ifndef MANGOS_MAPMANAGER_H
+#define MANGOS_MAPMANAGER_H
+
+#include "Utilities/MathDefines.h"
+#include "Platform/Define.h"
+#include "Policies/Singleton.h"
+#include "Map.h"
+#include "GridStates.h"
+#include "MapUpdater.h"
+#include <cmath>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <set>
+
+class Transport;
+class BattleGround;
+
+struct MapID
+{
+    explicit MapID(uint32 id) : nMapId(id), nInstanceId(0) {}
+    MapID(uint32 id, uint32 instid) : nMapId(id), nInstanceId(instid) {}
+
+    bool operator<(const MapID& val) const
+    {
+        if (nMapId == val.nMapId)
+        {
+            return nInstanceId < val.nInstanceId;
+        }
+
+        return nMapId < val.nMapId;
+    }
+
+    bool operator==(const MapID& val) const { return nMapId == val.nMapId && nInstanceId == val.nInstanceId; }
+
+    uint32 nMapId;
+    uint32 nInstanceId;
+};
+
+class MapManager : public MaNGOS::Singleton<MapManager>
+{
+        friend class MaNGOS::Singleton<MapManager>;
+
+    public:
+        typedef std::map<MapID, Map* > MapMapType;
+
+        Map* CreateMap(uint32, const WorldObject* obj);
+        Map* CreateBgMap(uint32 mapid, BattleGround* bg);
+        Map* FindMap(uint32 mapid, uint32 instanceId = 0) const;
+
+        void UpdateGridState(grid_state_t state, Map& map, NGridType& ngrid, GridInfo& ginfo, const uint32& x, const uint32& y, const uint32& t_diff);
+
+        // only const version for outer users
+        void DeleteInstance(uint32 mapid, uint32 instanceId);
+
+        void Initialize(void);
+        void Update(uint32);
+
+        void SetGridCleanUpDelay(uint32 t)
+        {
+            if (t < MIN_GRID_DELAY)
+            {
+                i_gridCleanUpDelay = MIN_GRID_DELAY;
+            }
+            else
+            {
+                i_gridCleanUpDelay = t;
+            }
+        }
+
+        /// MIN_MAP_UPDATE_DELAY is a floor, not a ceiling. This read `if (t > MIN) t = MIN`,
+        /// which crushed every value above the minimum down to it and made the config key a
+        /// no-op in the one direction an admin would ever use it.
+        void SetMapUpdateInterval(uint32 t)
+        {
+            if (t < MIN_MAP_UPDATE_DELAY)
+            {
+                t = MIN_MAP_UPDATE_DELAY;
+            }
+
+            i_timer.SetInterval(t);
+            i_timer.Reset();
+        }
+
+        void UnloadAll();
+
+        static bool ExistMapAndVMap(uint32 mapid, float x, float y);
+        static bool IsValidMAP(uint32 mapid);
+
+        static bool IsValidMapCoord(uint32 mapid, float x, float y)
+        {
+            return IsValidMAP(mapid) && MaNGOS::IsValidMapCoord(x, y);
+        }
+
+        static bool IsValidMapCoord(uint32 mapid, float x, float y, float z)
+        {
+            return IsValidMAP(mapid) && MaNGOS::IsValidMapCoord(x, y, z);
+        }
+
+        static bool IsValidMapCoord(uint32 mapid, float x, float y, float z, float o)
+        {
+            return IsValidMAP(mapid) && MaNGOS::IsValidMapCoord(x, y, z, o);
+        }
+
+        static bool IsValidMapCoord(WorldLocation const& loc)
+        {
+            return IsValidMapCoord(loc.mapid, loc.coord_x, loc.coord_y, loc.coord_z, loc.orientation);
+        }
+
+        void RemoveAllObjectsInRemoveList();
+
+        void LoadTransports();
+
+        /// Destroy every vessel and its crew. Must run while the maps are still alive.
+        void DestroyTransports();
+
+        typedef std::set<Transport*> TransportSet;
+        TransportSet m_Transports;
+
+        typedef std::map<uint32, TransportSet> TransportsByMapType;
+        TransportsByMapType m_TransportsByMap;
+
+        uint32 GenerateInstanceId() { return ++i_MaxInstanceId; }
+        void InitMaxInstanceId();
+        void InitializeVisibilityDistanceInfo();
+
+        /* statistics */
+        uint32 GetNumInstances();
+        uint32 GetNumPlayersInInstances();
+
+
+        // get list of all maps
+        const MapMapType& Maps() const { return i_maps; }
+
+        template<typename Do> void DoForAllMaps(Do& _do)
+        {
+            for (auto& mapData : i_maps)
+            {
+                _do(mapData.second);
+            }
+        }
+
+        template<typename Do>
+        void DoForAllMapsWithMapId(uint32 mapId, Do& _do);
+        void DoForAllMaps(const std::function<void(Map*)>& worker);
+
+    private:
+
+        // debugging code, should be deleted some day
+        GridState* si_GridStates[MAX_GRID_STATE];
+        int i_GridStateErrorCount;
+
+    private:
+
+        MapManager();
+        ~MapManager();
+
+        MapManager(const MapManager&);
+        MapManager& operator=(const MapManager&);
+
+        void InitStateMachine();
+        void DeleteStateMachine();
+
+        /**
+         * @brief Look up a loaded map with m_lock ALREADY held.
+         *
+         * The map-creation path runs entirely under m_lock and needs to check for an
+         * existing map as it goes (CreateMap, and CreateInstance beneath it). Calling
+         * the public FindMap() from there would re-lock m_lock — which is the only
+         * reason that mutex used to be recursive. Routing the internal callers through
+         * this instead removes the re-entrancy, so a plain mutex suffices.
+         */
+        Map* FindMap_unlocked(uint32 mapid, uint32 instanceId = 0) const;
+
+        Map* CreateInstance(uint32 id, Player* player);
+        DungeonMap* CreateDungeonMap(uint32 id, uint32 InstanceId, Difficulty difficulty, DungeonPersistentState* save = NULL);
+        BattleGroundMap* CreateBattleGroundMap(uint32 id, uint32 InstanceId, BattleGround* bg);
+
+        uint32 i_gridCleanUpDelay;
+        MapMapType i_maps;
+        IntervalTimer i_timer;
+        MapUpdater m_updater;
+        uint32 i_MaxInstanceId;
+
+        /// Plain, not recursive — see FindMap_unlocked().
+        typedef std::mutex LOCK_TYPE;
+        mutable LOCK_TYPE m_lock;
+};
+
+template<typename Do>
+inline void MapManager::DoForAllMapsWithMapId(uint32 mapId, Do& _do)
+{
+    MapMapType::const_iterator start = i_maps.lower_bound(MapID(mapId, 0));
+    MapMapType::const_iterator end   = i_maps.lower_bound(MapID(mapId + 1, 0));
+    for (MapMapType::const_iterator itr = start; itr != end; ++itr)
+    {
+        _do(itr->second);
+    }
+}
+
+#define sMapMgr MapManager::Instance()
+
+#endif

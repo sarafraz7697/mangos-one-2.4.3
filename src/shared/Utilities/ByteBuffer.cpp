@@ -1,0 +1,171 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * MaNGOS is a full featured server for World of Warcraft, supporting
+ * the following clients: 1.12.x, 2.4.3, 3.3.5a, 4.3.4a and 5.4.8
+ *
+ * Copyright (C) 2005-2026 MaNGOS <https://www.getmangos.eu>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * World of Warcraft, and all World of Warcraft or Warcraft art, images,
+ * and lore are copyrighted by Blizzard Entertainment, Inc.
+ */
+
+/**
+ * @file ByteBuffer.cpp
+ * @brief ByteBuffer debugging and utility implementations
+ *
+ * This file provides debugging output functions for the ByteBuffer
+ * class, including hex dumps and formatted storage displays.
+ */
+
+#include <cstdio>
+#include "ByteBuffer.h"
+#include "Log/Log.h"
+
+#include <sstream>
+
+/**
+ * @brief Print exception details with position information
+ *
+ * Logs the error message including the operation (read/write),
+ * position in buffer, buffer size, and attempted value size.
+ * Includes stack trace if ACE stack trace is available.
+ */
+void ByteBufferException::PrintPosError() const
+{
+    sLog.outError(
+        "Attempted to %s in ByteBuffer (pos: %zu size: %zu) value with size: %zu",
+        (add ? "put" : "get"), pos, size, esize);
+}
+
+/**
+ * @brief Print buffer contents as decimal values
+ *
+ * Outputs the entire buffer content as decimal numbers to the debug log.
+ * Only outputs if debug log level is enabled to avoid performance impact.
+ * Format: "STORAGE_SIZE: N" followed by each byte as decimal.
+ */
+void ByteBuffer::print_storage() const
+{
+    if (!sLog.HasLogLevelOrHigher(LOG_LVL_DEBUG))   // optimize disabled debug output
+    {
+        return;
+    }
+
+    std::ostringstream ss;
+    ss <<  "STORAGE_SIZE: " << size() << "\n";
+
+    if (sLog.IsIncludeTime())
+    {
+        ss << "         ";
+    }
+
+    for (size_t i = 0; i < size(); ++i)
+    {
+        ss << uint32(read<uint8>(i)) << " - ";
+    }
+
+    sLog.outDebug("%s", ss.str().c_str());
+}
+
+/**
+ * @brief Print buffer contents as text/ASCII
+ *
+ * Outputs the buffer content interpreted as ASCII text to the debug log.
+ * Non-printable characters will be output as-is, which may appear garbled.
+ * Only outputs if debug log level is enabled.
+ * Useful for reading text-based packet contents.
+ */
+void ByteBuffer::textlike() const
+{
+    if (!sLog.HasLogLevelOrHigher(LOG_LVL_DEBUG))   // optimize disabled debug output
+    {
+        return;
+    }
+
+    std::ostringstream ss;
+    ss <<  "STORAGE_SIZE: " << size() << "\n";
+
+    if (sLog.IsIncludeTime())
+    {
+        ss << "         ";
+    }
+
+    for (size_t i = 0; i < size(); ++i)
+    {
+        ss << read<uint8>(i);
+    }
+
+    sLog.outDebug("%s", ss.str().c_str());
+}
+
+/**
+ * @brief Print buffer contents as formatted hexadecimal
+ *
+ * Outputs the buffer content as formatted hexadecimal to the debug log.
+ * Format includes:
+ * - 16 bytes per line
+ * - Separator line after 8 bytes ("|")
+ * - Newline every 16 bytes
+ * - Two-digit uppercase hex values
+ *
+ * This is the most common format for analyzing binary packet data.
+ * Only outputs if debug log level is enabled.
+ */
+void ByteBuffer::hexlike() const
+{
+    if (!sLog.HasLogLevelOrHigher(LOG_LVL_DEBUG))   // optimize disabled debug output
+    {
+        return;
+    }
+
+    std::ostringstream ss;
+    ss <<  "STORAGE_SIZE: " << size() << "\n";
+
+    if (sLog.IsIncludeTime())
+    {
+        ss << "         ";
+    }
+
+    size_t j = 1, k = 1;
+
+    for (size_t i = 0; i < size(); ++i)
+    {
+        if ((i == (j * 8)) && ((i != (k * 16))))
+        {
+            ss << "| ";
+            ++j;
+        }
+        else if (i == (k * 16))
+        {
+            ss << "\n";
+
+            if (sLog.IsIncludeTime())
+            {
+                ss << "         ";
+            }
+
+            ++k;
+            ++j;
+        }
+
+        char buf[4];
+        snprintf(buf, 4, "%02X", read<uint8>(i));
+        ss << buf << " ";
+    }
+
+    sLog.outDebug("%s", ss.str().c_str());
+}

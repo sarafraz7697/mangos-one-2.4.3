@@ -1,0 +1,534 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * MaNGOS is a full featured server for World of Warcraft, supporting
+ * the following clients: 1.12.x, 2.4.3, 3.3.5a, 4.3.4a and 5.4.8
+ *
+ * Copyright (C) 2005-2026 MaNGOS <https://www.getmangos.eu>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * World of Warcraft, and all World of Warcraft or Warcraft art, images,
+ * and lore are copyrighted by Blizzard Entertainment, Inc.
+ */
+
+/**
+ * @file ServerCommands.cpp
+ * @brief Implementation of server management chat commands.
+ *
+ * This file contains chat command handlers for server operations including:
+ * - Server status and information
+ * - Player count display
+ * - Server configuration queries
+ * - Shutdown and restart operations
+ */
+
+#include "Chat.h"
+#include "ObjectMgr.h"
+#include "World.h"
+#include "Config.h"
+#include "GitRevision.h"
+#include "SystemConfig.h"
+#include "UpdateTime.h"
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include "CorpseManager.h"
+
+/**
+ * @brief Handler for HandleServerInfoCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerInfoCommand(char* /*args*/)
+{
+    uint32 activeClientsNum = sWorld.GetActiveSessionCount();
+    uint32 queuedClientsNum = sWorld.GetQueuedSessionCount();
+    uint32 maxActiveClientsNum = sWorld.GetMaxActiveSessionCount();
+    uint32 maxQueuedClientsNum = sWorld.GetMaxQueuedSessionCount();
+    std::string str = secsToTimeString(sWorld.GetUptime());
+    uint32 updateTime = sWorldUpdateTime.GetLastUpdateTime();
+
+    char const* full;
+    full = GitRevision::GetProjectRevision();
+    SendSysMessage(full);
+
+    if (sScriptMgr.IsScriptLibraryLoaded())
+    {
+        char const* ver = sScriptMgr.GetScriptLibraryVersion();
+        if (ver && *ver)
+        {
+            PSendSysMessage(LANG_USING_SCRIPT_LIB, ver);
+        }
+        else
+        {
+            SendSysMessage(LANG_USING_SCRIPT_LIB_UNKNOWN);
+        }
+    }
+    else
+    {
+        SendSysMessage(LANG_USING_SCRIPT_LIB_NONE);
+    }
+
+    PSendSysMessage("%s", GitRevision::GetFullRevision());
+    PSendSysMessage("%s", GitRevision::GetDepElunaFullRevisionStr());
+    PSendSysMessage("%s", GitRevision::GetDepSD3FullRevisionStr());
+    PSendSysMessage("%s", GitRevision::GetRunningSystem());
+
+    PSendSysMessage(LANG_USING_WORLD_DB, sWorld.GetDBVersion());
+    PSendSysMessage(LANG_CONNECTED_USERS, activeClientsNum, maxActiveClientsNum, queuedClientsNum, maxQueuedClientsNum);
+    PSendSysMessage(LANG_UPTIME, str.c_str());
+    PSendSysMessage("World Delay: %u", updateTime); // ToDo: move to language string
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleServerMotdCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerMotdCommand(char* /*args*/)
+{
+    PSendSysMessage(LANG_MOTD_CURRENT, sWorld.GetMotd());
+    return true;
+}
+
+/**
+ * @brief Handler for HandleServerShutDownCancelCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerShutDownCancelCommand(char* /*args*/)
+{
+    sWorld.ShutdownCancel();
+    return true;
+}
+
+/**
+ * @brief Handler for HandleServerShutDownCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerShutDownCommand(char* args)
+{
+    if (!*args)
+    {
+        return false;
+    }
+
+    char* timeStr = strtok((char*)args, " ");
+    char* exitCodeStr = strtok(NULL, "");
+
+    int32 time = atoi(timeStr);
+
+    // Prevent interpret wrong arg value as 0 secs shutdown time
+    if ((time == 0 && (timeStr[0] != '0' || timeStr[1] != '\0')) || time < 0)
+    {
+        return false;
+    }
+
+    if (exitCodeStr)
+    {
+        int32 exitCode = atoi(exitCodeStr);
+
+        // Handle atoi() errors
+        if (exitCode == 0 && (exitCodeStr[0] != '0' || exitCodeStr[1] != '\0'))
+        {
+            return false;
+        }
+
+        // Exit code should be in range of 0-125, 126-255 is used
+        // in many shells for their own return codes and code > 255
+        // is not supported in many others
+        if (exitCode < 0 || exitCode > 125)
+        {
+            return false;
+        }
+
+        sWorld.ShutdownServ(time, SHUTDOWN_MASK_STOP, exitCode);
+    }
+    else
+    {
+        sWorld.ShutdownServ(time, SHUTDOWN_MASK_STOP, SHUTDOWN_EXIT_CODE);
+    }
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleServerRestartCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerRestartCommand(char* args)
+{
+    if (!*args)
+    {
+        return false;
+    }
+
+    char* timeStr = strtok((char*)args, " ");
+    char* exitCodeStr = strtok(NULL, "");
+
+    int32 time = atoi(timeStr);
+
+    //  Prevent interpret wrong arg value as 0 secs shutdown time
+    if ((time == 0 && (timeStr[0] != '0' || timeStr[1] != '\0')) || time < 0)
+    {
+        return false;
+    }
+
+    if (exitCodeStr)
+    {
+        int32 exitCode = atoi(exitCodeStr);
+
+        // Handle atoi() errors
+        if (exitCode == 0 && (exitCodeStr[0] != '0' || exitCodeStr[1] != '\0'))
+        {
+            return false;
+        }
+
+        // Exit code should be in range of 0-125, 126-255 is used
+        // in many shells for their own return codes and code > 255
+        // is not supported in many others
+        if (exitCode < 0 || exitCode > 125)
+        {
+            return false;
+        }
+
+        sWorld.ShutdownServ(time, SHUTDOWN_MASK_RESTART, exitCode);
+    }
+    else
+    {
+        sWorld.ShutdownServ(time, SHUTDOWN_MASK_RESTART, RESTART_EXIT_CODE);
+    }
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleServerIdleRestartCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerIdleRestartCommand(char* args)
+{
+    if (!*args)
+    {
+        return false;
+    }
+
+    char* timeStr = strtok((char*)args, " ");
+    char* exitCodeStr = strtok(NULL, "");
+
+    int32 time = atoi(timeStr);
+
+    //  Prevent interpret wrong arg value as 0 secs shutdown time
+    if ((time == 0 && (timeStr[0] != '0' || timeStr[1] != '\0')) || time < 0)
+    {
+        return false;
+    }
+
+    if (exitCodeStr)
+    {
+        int32 exitCode = atoi(exitCodeStr);
+
+        // Handle atoi() errors
+        if (exitCode == 0 && (exitCodeStr[0] != '0' || exitCodeStr[1] != '\0'))
+        {
+            return false;
+        }
+
+        // Exit code should be in range of 0-125, 126-255 is used
+        // in many shells for their own return codes and code > 255
+        // is not supported in many others
+        if (exitCode < 0 || exitCode > 125)
+        {
+            return false;
+        }
+
+        sWorld.ShutdownServ(time, SHUTDOWN_MASK_IDLE, exitCode);
+    }
+    else
+    {
+        sWorld.ShutdownServ(time, SHUTDOWN_MASK_IDLE, SHUTDOWN_EXIT_CODE);
+    }
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleServerIdleShutDownCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerIdleShutDownCommand(char* args)
+{
+    if (!*args)
+    {
+        return false;
+    }
+
+    char* timeStr = strtok((char*)args, " ");
+    char* exitCodeStr = strtok(NULL, "");
+
+    int32 time = atoi(timeStr);
+
+    //  Prevent interpret wrong arg value as 0 secs shutdown time
+    if ((time == 0 && (timeStr[0] != '0' || timeStr[1] != '\0')) || time < 0)
+    {
+        return false;
+    }
+
+    if (exitCodeStr)
+    {
+        int32 exitCode = atoi(exitCodeStr);
+
+        // Handle atoi() errors
+        if (exitCode == 0 && (exitCodeStr[0] != '0' || exitCodeStr[1] != '\0'))
+        {
+            return false;
+        }
+
+        // Exit code should be in range of 0-125, 126-255 is used
+        // in many shells for their own return codes and code > 255
+        // is not supported in many others
+        if (exitCode < 0 || exitCode > 125)
+        {
+            return false;
+        }
+
+        sWorld.ShutdownServ(time, SHUTDOWN_MASK_IDLE, exitCode);
+    }
+    else
+    {
+        sWorld.ShutdownServ(time, SHUTDOWN_MASK_IDLE, RESTART_EXIT_CODE);
+    }
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleServerExitCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerExitCommand(char* /*args*/)
+{
+    SendSysMessage(LANG_COMMAND_EXIT);
+    World::StopNow(SHUTDOWN_EXIT_CODE);
+    return true;
+}
+
+/**
+ * @brief Handler for HandleServerLogFilterCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerLogFilterCommand(char* args)
+{
+    if (!*args)
+    {
+        SendSysMessage(LANG_LOG_FILTERS_STATE_HEADER);
+        for (int i = 0; i < LOG_FILTER_COUNT; ++i)
+        {
+            if (*logFilterData[i].name)
+            {
+                PSendSysMessage("  %-20s = %s", logFilterData[i].name, GetOnOffStr(sLog.HasLogFilter(1 << i)));
+            }
+        }
+        return true;
+    }
+
+    char* filtername = ExtractLiteralArg(&args);
+    if (!filtername)
+    {
+        return false;
+    }
+
+    bool value;
+    if (!ExtractOnOff(&args, value))
+    {
+        SendSysMessage(LANG_USE_BOL);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    if (strncmp(filtername, "all", 4) == 0)
+    {
+        sLog.SetLogFilter(LogFilters(0xFFFFFFFF), value);
+        PSendSysMessage(LANG_ALL_LOG_FILTERS_SET_TO_S, GetOnOffStr(value));
+        return true;
+    }
+
+    for (int i = 0; i < LOG_FILTER_COUNT; ++i)
+    {
+        if (!*logFilterData[i].name)
+        {
+            continue;
+        }
+
+        if (!strncmp(filtername, logFilterData[i].name, strlen(filtername)))
+        {
+            sLog.SetLogFilter(LogFilters(1 << i), value);
+            PSendSysMessage("  %-20s = %s", logFilterData[i].name, GetOnOffStr(value));
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * @brief Handler for HandleServerLogLevelCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerLogLevelCommand(char* args)
+{
+    if (!*args)
+    {
+        PSendSysMessage("Log level: %u", sLog.GetLogLevel());
+        return true;
+    }
+
+    sLog.SetLogLevel(args);
+    return true;
+}
+
+/**
+ * @brief Handler for HandleServerCorpsesCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerCorpsesCommand(char* /*args*/)
+{
+    sCorpseManager.RemoveOldCorpses();
+    return true;
+}
+
+/**
+ * @brief Handler for HandleServerResetAllRaidCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerResetAllRaidCommand(char* /*args*/)
+{
+    PSendSysMessage("Global raid instances reset, all players in raid instances will be teleported to homebind!");
+    sMapPersistentStateMgr.GetScheduler().ResetAllRaid();
+    return true;
+}
+
+/**
+ * @brief Handler for HandleServerSetMotdCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerSetMotdCommand(char* args)
+{
+    sWorld.SetMotd(args);
+    PSendSysMessage(LANG_MOTD_NEW, args);
+    return true;
+}
+
+/**
+ * @brief Handler for HandleServerPLimitCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleServerPLimitCommand(char* args)
+{
+    if (*args)
+    {
+        char* param = ExtractLiteralArg(&args);
+        if (!param)
+        {
+            return false;
+        }
+
+        int l = strlen(param);
+
+        int val;
+        if (strncmp(param, "player", l) == 0)
+        {
+            sWorld.SetPlayerLimit(-SEC_PLAYER);
+        }
+        else if (strncmp(param, "moderator", l) == 0)
+        {
+            sWorld.SetPlayerLimit(-SEC_MODERATOR);
+        }
+        else if (strncmp(param, "gamemaster", l) == 0)
+        {
+            sWorld.SetPlayerLimit(-SEC_GAMEMASTER);
+        }
+        else if (strncmp(param, "administrator", l) == 0)
+        {
+            sWorld.SetPlayerLimit(-SEC_ADMINISTRATOR);
+        }
+        else if (strncmp(param, "reset", l) == 0)
+        {
+            sWorld.SetPlayerLimit(sConfig.GetIntDefault("PlayerLimit", DEFAULT_PLAYER_LIMIT));
+        }
+        else if (ExtractInt32(&param, val))
+        {
+            if (val < -SEC_ADMINISTRATOR)
+            {
+                val = -SEC_ADMINISTRATOR;
+            }
+
+            sWorld.SetPlayerLimit(val);
+        }
+        else
+        {
+            return false;
+        }
+
+        // kick all low security level players
+        if (sWorld.GetPlayerAmountLimit() > SEC_PLAYER)
+        {
+            sWorld.KickAllLess(sWorld.GetPlayerSecurityLimit());
+        }
+    }
+
+    uint32 pLimit = sWorld.GetPlayerAmountLimit();
+    AccountTypes allowedAccountType = sWorld.GetPlayerSecurityLimit();
+    char const* secName;
+    switch (allowedAccountType)
+    {
+        case SEC_PLAYER:        secName = "Player";        break;
+        case SEC_MODERATOR:     secName = "Moderator";     break;
+        case SEC_GAMEMASTER:    secName = "Gamemaster";    break;
+        case SEC_ADMINISTRATOR: secName = "Administrator"; break;
+        default:                secName = "<unknown>";     break;
+    }
+
+    PSendSysMessage("Player limits: amount %u, min. security level %s.", pLimit, secName);
+
+    return true;
+}

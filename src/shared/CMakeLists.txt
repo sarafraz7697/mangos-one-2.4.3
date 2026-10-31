@@ -1,0 +1,329 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# MaNGOS is a full featured server for World of Warcraft, supporting
+# the following clients: 1.12.x, 2.4.3, 3.3.5a, 4.3.4a and 5.4.8
+#
+# Copyright (C) 2005-2026 MaNGOS <https://www.getmangos.eu>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+include(TestBigEndian)
+
+set(SRC_GRP_AUTH
+  Auth/ARC4.cpp
+  Auth/ARC4.h
+  Auth/AuthCrypt.cpp
+  Auth/AuthCrypt.h
+  Auth/BigNumber.cpp
+  Auth/BigNumber.h
+  Auth/HMACSHA1.cpp
+  Auth/HMACSHA1.h
+  Auth/Md5.h
+  Auth/Sha1.cpp
+  Auth/Sha1.h
+)
+source_group("Auth" FILES ${SRC_GRP_AUTH})
+
+set(SRC_GRP_COMMON
+  Common/Locales.cpp
+  Common/Locales.h
+  Common/TimeConstants.h
+  Common/ServerDefines.h
+  Common/GitRevision.cpp
+  Common/GitRevision.h
+)
+source_group("Common" FILES ${SRC_GRP_COMMON})
+
+set(SRC_GRP_CONFIG
+  Config/Config.cpp
+  Config/Config.h
+)
+source_group("Config" FILES ${SRC_GRP_CONFIG})
+
+set(SRC_GRP_DATASTORE
+  DataStores/DBCFileLoader.cpp
+  DataStores/DBCFileLoader.h
+  DataStores/DBCStore.h
+)
+source_group("DataStores" FILES ${SRC_GRP_DATASTORE})
+
+set(SRC_GRP_DATABASE
+  Database/Database.cpp
+  Database/Database.h
+  Database/DatabaseEnv.h
+  Database/DatabaseMysql.cpp
+  Database/DatabaseMysql.h
+  Database/Field.cpp
+  Database/Field.h
+  Database/QueryResult.h
+  Database/QueryResultMysql.cpp
+  Database/QueryResultMysql.h
+  Database/SQLStorage.cpp
+  Database/SQLStorage.h
+  Database/SQLStorageImpl.h
+  Database/SqlDelayThread.cpp
+  Database/SqlDelayThread.h
+  Database/SqlOperations.cpp
+  Database/SqlOperations.h
+  Database/SqlPreparedStatement.cpp
+  Database/SqlPreparedStatement.h
+)
+source_group("Database" FILES ${SRC_GRP_DATABASE})
+
+set(SRC_GRP_DYNAMIC
+  Dynamic/FactoryHolder.h
+  Dynamic/ObjectRegistry.h
+)
+source_group("Dynamic" FILES ${SRC_GRP_DYNAMIC})
+
+set(SRC_GRP_GAMESYSTEM
+  GameSystem/Grid.h
+  GameSystem/GridRefManager.h
+  GameSystem/GridReference.h
+  GameSystem/NGrid.h
+  GameSystem/TypeContainer.h
+  GameSystem/TypeContainerVisitor.h
+)
+source_group("GameSystem" FILES ${SRC_GRP_GAMESYSTEM})
+
+set(SRC_GRP_LOCKQ
+  LockedQueue/LockedQueue.h
+)
+source_group("LockedQueue" FILES ${SRC_GRP_LOCKQ})
+
+set(SRC_GRP_CONSOLE
+  Console/ConsoleUI.cpp
+  Console/ConsoleUI.h
+  Console/Terminal.cpp
+  Console/Terminal.h
+)
+source_group("Console" FILES ${SRC_GRP_CONSOLE})
+
+set(SRC_GRP_LOG
+  Log/Log.cpp
+  Log/Log.h
+  Log/ConsoleLogWriter.cpp
+  Log/ConsoleLogWriter.h
+)
+source_group("Log" FILES ${SRC_GRP_LOG})
+
+set(SRC_GRP_THREAD
+  Threading/ThreadLocalStore.h
+  Threading/Threading.cpp
+  Threading/Threading.h
+)
+source_group("Threading" FILES ${SRC_GRP_THREAD})
+
+# Shared networking engine. The backends self-collapse on the platforms they do not
+# serve (IocpServer is #ifdef _WIN32, the reactor is #ifndef _WIN32), so they can all
+# be listed unconditionally. io_uring is the exception: it needs liburing, so it is
+# only compiled when the option above resolved.
+set(SRC_GRP_NET
+  net/BindAddress.cpp
+  net/BindAddress.hpp
+  net/FlowControl.hpp
+  net/ISession.hpp
+  net/SendQueue.hpp
+  net/Server.hpp
+  net/iocp/IocpServer.cpp
+  net/iocp/IocpServer.hpp
+  net/reactor/Connection.hpp
+  net/reactor/EpollPoller.cpp
+  net/reactor/EpollPoller.hpp
+  net/reactor/KqueuePoller.cpp
+  net/reactor/KqueuePoller.hpp
+  net/reactor/Poller.hpp
+  net/reactor/PollerFactory.cpp
+  net/reactor/ReactorServer.cpp
+  net/reactor/ReactorServer.hpp
+)
+if(MANGOS_USE_IO_URING)
+  list(APPEND SRC_GRP_NET
+    net/uring/UringServer.cpp
+    net/uring/UringServer.hpp
+  )
+endif()
+source_group("net" FILES ${SRC_GRP_NET})
+
+set(SRC_GRP_PLATFORM
+  Platform/CompilerDefs.h
+  Platform/Define.h
+)
+source_group("Platform" FILES ${SRC_GRP_PLATFORM})
+
+set(SRC_GRP_POLICIES
+  Policies/Singleton.h
+)
+source_group("Policies" FILES ${SRC_GRP_POLICIES})
+
+if(WIN32)
+    set(SRC_GRP_SVC
+      Win/ServiceWin32.cpp
+      Win/ServiceWin32.h
+      Win/WheatyExceptionReport.cpp
+      Win/WheatyExceptionReport.h
+    )
+else()
+    set(SRC_GRP_SVC
+      Linux/PosixDaemon.cpp
+      Linux/PosixDaemon.h
+    )
+endif()
+source_group("Services" FILES ${SRC_GRP_SVC})
+
+set(SRC_GRP_UTILITIES
+  Utilities/IdList.h
+  Utilities/ByteBuffer.cpp
+  Utilities/ByteBuffer.h
+  Utilities/Errors.h
+  Utilities/ProgressBar.cpp
+  Utilities/MathDefines.h
+  Utilities/PackedValues.h
+  Utilities/ProgressBar.h
+  Utilities/ProgressBarRender.h
+  Utilities/RNGen.h
+  Utilities/ScheduledExit.cpp
+  Utilities/ScheduledExit.h
+  Utilities/Timer.h
+  Utilities/Util.cpp
+  Utilities/Util.h
+  Utilities/ByteConverter.h
+  Utilities/Callback.h
+  Utilities/EventProcessor.cpp
+  Utilities/EventProcessor.h
+  Utilities/LinkedList.h
+  Utilities/LinkedReference/RefManager.h
+  Utilities/LinkedReference/Reference.h
+  Utilities/TypeList.h
+)
+source_group("Utilities" FILES ${SRC_GRP_UTILITIES})
+
+set(TGT_INCL
+  Auth
+  Common
+  Config
+  Console
+  DataStores
+  Database
+  Linux
+  LockedQueue
+  Log
+  Threading
+  Utilities
+  Utilities/LinkedReference
+  Win
+  Dynamic
+  GameSystem
+  Platform
+  Policies
+)
+
+configure_file(revision_data.h.in ${CMAKE_CURRENT_BINARY_DIR}/revision_data.h)
+configure_file(SystemConfig.h.in ${CMAKE_CURRENT_BINARY_DIR}/SystemConfig.h)
+
+TEST_BIG_ENDIAN(ENDIAN_VALUE)
+
+# =============================================================================
+# dataintegrity -- the SHA-256 manifest, as a library of its own.
+#
+# Not part of `shared`, on purpose. The baker has to WRITE the manifest the server
+# READS, and `shared` exports MySQL as a PUBLIC dependency; linking it into the
+# extractor to reach two files would drag a database client into a tool that has never
+# needed one. This target carries OpenSSL and nothing else -- and OpenSSL is already
+# mandatory for the whole project, so it adds no requirement to either side.
+#
+# One implementation, both consumers: the format cannot drift from itself.
+# =============================================================================
+add_library(dataintegrity STATIC
+    DataIntegrity/DataManifest.cpp
+    DataIntegrity/DataManifest.h
+    DataIntegrity/Sha256.cpp
+    DataIntegrity/Sha256.h
+)
+
+target_include_directories(dataintegrity
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(dataintegrity
+    PUBLIC
+        Threads::Threads
+    PRIVATE
+        mangos_openssl
+        mangos_openssl_strict
+)
+
+set_target_properties(dataintegrity PROPERTIES FOLDER "shared")
+
+add_library(shared STATIC
+    ${SRC_GRP_AUTH}
+    ${SRC_GRP_COMMON}
+    ${SRC_GRP_CONFIG}
+    ${SRC_GRP_DATASTORE}
+    ${SRC_GRP_DATABASE}
+    ${SRC_GRP_DYNAMIC}
+    ${SRC_GRP_GAMESYSTEM}
+    ${SRC_GRP_LOCKQ}
+    ${SRC_GRP_CONSOLE}
+    ${SRC_GRP_LOG}
+    ${SRC_GRP_NET}
+    ${SRC_GRP_THREAD}
+    ${SRC_GRP_PLATFORM}
+    ${SRC_GRP_POLICIES}
+    ${SRC_GRP_SVC}
+    ${SRC_GRP_UTILITIES}
+    ${CMAKE_CURRENT_BINARY_DIR/revision_data.h}
+    ${CMAKE_CURRENT_BINARY_DIR/SystemConfig.h}
+)
+
+target_include_directories(shared
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${TGT_INCL}
+)
+
+target_compile_definitions(shared
+    PUBLIC
+        ${MANGOS_EXP}
+        $<$<CONFIG:Debug>:MANGOS_DEBUG>
+        MANGOS_ENDIAN=${ENDIAN_VALUE}
+        $<$<BOOL:${ENDIAN_VALUE}>:ARCH_IS_BIG_ENDIAN>
+        $<$<BOOL:${SCRIPT_LIB_ELUNA}>:ENABLE_ELUNA ELUNA_EXPANSION=1 ELUNA_MANGOS>
+        # PUBLIC: net/Server.hpp is a header, so every consumer must agree on which
+        # backend it selects, or they would disagree about what net::Server even is.
+        $<$<BOOL:${MANGOS_USE_IO_URING}>:MANGOS_USE_IO_URING>
+)
+
+target_link_libraries(shared
+    PUBLIC
+        utf8
+        MySQL::MySQL
+        dataintegrity
+        ${CMAKE_DL_LIBS}
+        mangos_openssl
+        Threads::Threads
+        $<$<BOOL:${WIN32}>:dbghelp>
+        # Winsock + the AcceptEx/GetAcceptExSockaddrs extensions used by IocpServer.
+        $<$<BOOL:${WIN32}>:ws2_32>
+        $<$<BOOL:${WIN32}>:mswsock>
+        $<$<BOOL:${MANGOS_USE_IO_URING}>:${URING_LIBRARY}>
+    PRIVATE
+        mangos_openssl_strict
+)
+
+if(MANGOS_USE_IO_URING)
+    target_include_directories(shared PUBLIC ${URING_INCLUDE_DIR})
+endif()

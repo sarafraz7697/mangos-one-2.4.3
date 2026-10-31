@@ -1,0 +1,601 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * MaNGOS is a full featured server for World of Warcraft, supporting
+ * the following clients: 1.12.x, 2.4.3, 3.3.5a, 4.3.4a and 5.4.8
+ *
+ * Copyright (C) 2005-2026 MaNGOS <https://www.getmangos.eu>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * World of Warcraft, and all World of Warcraft or Warcraft art, images,
+ * and lore are copyrighted by Blizzard Entertainment, Inc.
+ */
+
+/**
+ * @file CastAndAuraCommands.cpp
+ * @brief Implementation of spell casting and aura management chat commands.
+ *
+ * This file contains chat command handlers for spell and aura operations including:
+ * - Spell casting on players and creatures
+ * - Aura application and removal
+ * - Spell effect testing and debugging
+ */
+
+#include "Chat.h"
+#include "Language.h"
+#include "SpellAuras.h"
+#include "SpellMgr.h"
+#include <string>
+
+/**********************************************************************
+    CommandTable : castCommandTable
+ ***********************************************************************/
+
+bool AddAuraToPlayer(const SpellEntry* spellInfo, Unit* target, WorldObject* caster);
+
+/**
+ * @brief Handler for HandleCastCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleCastCommand(char* args)
+{
+    if (!*args)
+    {
+        return false;
+    }
+
+    Unit* target = getSelectedUnit();
+
+    if (!target)
+    {
+        SendSysMessage(LANG_SELECT_CHAR_OR_CREATURE);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    // number or [name] Shift-click form |color|Hspell:spell_id|h[name]|h|r or Htalent form
+    uint32 spell = ExtractSpellIdFromLink(&args);
+    if (!spell)
+    {
+        return false;
+    }
+
+    SpellEntry const* spellInfo = sSpellStore.LookupEntry(spell);
+    if (!spellInfo)
+    {
+        return false;
+    }
+
+    if (!m_session)
+    {
+        target->CastSpell(target, spell, true);
+        PSendSysMessage("Cast spell %u (%s) on %s",
+            spell, spellInfo->Name_lang[GetSessionDbcLocale()],
+            target->GetName());
+        return true;
+    }
+
+    if (!SpellMgr::IsSpellValid(spellInfo, m_session->GetPlayer()))
+    {
+        PSendSysMessage(LANG_COMMAND_SPELL_BROKEN, spell);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    bool triggered = ExtractLiteralArg(&args, "triggered") != NULL;
+    if (!triggered && *args)                                // can be fail also at syntax error
+    {
+        return false;
+    }
+
+    m_session->GetPlayer()->CastSpell(target, spell, triggered);
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleCastBackCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleCastBackCommand(char* args)
+{
+    Creature* caster = getSelectedCreature();
+
+    if (!caster)
+    {
+        SendSysMessage(LANG_SELECT_CHAR_OR_CREATURE);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    // number or [name] Shift-click form |color|Hspell:spell_id|h[name]|h|r
+    // number or [name] Shift-click form |color|Hspell:spell_id|h[name]|h|r or Htalent form
+    uint32 spell = ExtractSpellIdFromLink(&args);
+    if (!spell || !sSpellStore.LookupEntry(spell))
+    {
+        return false;
+    }
+
+    bool triggered = ExtractLiteralArg(&args, "triggered") != NULL;
+    if (!triggered && *args)                                // can be fail also at syntax error
+    {
+        return false;
+    }
+
+    caster->SetFacingToObject(m_session->GetPlayer());
+
+    caster->CastSpell(m_session->GetPlayer(), spell, triggered);
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleCastDistCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleCastDistCommand(char* args)
+{
+    if (!*args)
+    {
+        return false;
+    }
+
+    // number or [name] Shift-click form |color|Hspell:spell_id|h[name]|h|r or Htalent form
+    uint32 spell = ExtractSpellIdFromLink(&args);
+    if (!spell)
+    {
+        return false;
+    }
+
+    SpellEntry const* spellInfo = sSpellStore.LookupEntry(spell);
+    if (!spellInfo)
+    {
+        return false;
+    }
+
+    if (!SpellMgr::IsSpellValid(spellInfo, m_session->GetPlayer()))
+    {
+        PSendSysMessage(LANG_COMMAND_SPELL_BROKEN, spell);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    float dist;
+    if (!ExtractFloat(&args, dist))
+    {
+        return false;
+    }
+
+    bool triggered = ExtractLiteralArg(&args, "triggered") != NULL;
+    if (!triggered && *args)                                // can be fail also at syntax error
+    {
+        return false;
+    }
+
+    float x, y, z;
+    ClosePointNear(*m_session->GetPlayer(), x, y, z, dist);
+
+    m_session->GetPlayer()->CastSpell(x, y, z, spell, triggered);
+    return true;
+}
+
+/**
+ * @brief Handler for HandleCastTargetCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleCastTargetCommand(char* args)
+{
+    Creature* caster = getSelectedCreature();
+
+    if (!caster)
+    {
+        SendSysMessage(LANG_SELECT_CHAR_OR_CREATURE);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    if (!caster->getVictim())
+    {
+        SendSysMessage(LANG_SELECTED_TARGET_NOT_HAVE_VICTIM);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    // number or [name] Shift-click form |color|Hspell:spell_id|h[name]|h|r or Htalent form
+    uint32 spell = ExtractSpellIdFromLink(&args);
+    if (!spell || !sSpellStore.LookupEntry(spell))
+    {
+        return false;
+    }
+
+    bool triggered = ExtractLiteralArg(&args, "triggered") != NULL;
+    if (!triggered && *args)                                // can be fail also at syntax error
+    {
+        return false;
+    }
+
+    caster->SetFacingToObject(m_session->GetPlayer());
+
+    caster->CastSpell(caster->getVictim(), spell, triggered);
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleCastSelfCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleCastSelfCommand(char* args)
+{
+    if (!*args)
+    {
+        return false;
+    }
+
+    Unit* target = getSelectedUnit();
+
+    if (!target)
+    {
+        SendSysMessage(LANG_SELECT_CHAR_OR_CREATURE);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    // number or [name] Shift-click form |color|Hspell:spell_id|h[name]|h|r or Htalent form
+    uint32 spell = ExtractSpellIdFromLink(&args);
+    if (!spell)
+    {
+        return false;
+    }
+
+    SpellEntry const* spellInfo = sSpellStore.LookupEntry(spell);
+    if (!spellInfo)
+    {
+        return false;
+    }
+
+    if (!SpellMgr::IsSpellValid(spellInfo, m_session->GetPlayer()))
+    {
+        PSendSysMessage(LANG_COMMAND_SPELL_BROKEN, spell);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    bool triggered = ExtractLiteralArg(&args, "triggered") != NULL;
+    if (!triggered && *args)                                // can be fail also at syntax error
+    {
+        return false;
+    }
+
+    target->CastSpell(target, spell, triggered);
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleAuraCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleAuraCommand(char* args)
+{
+    Unit* target = getSelectedUnit();
+    if (!target)
+    {
+        SendSysMessage(LANG_SELECT_CHAR_OR_CREATURE);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    // number or [name] Shift-click form |color|Hspell:spell_id|h[name]|h|r or Htalent form
+    uint32 spellID = ExtractSpellIdFromLink(&args);
+
+    SpellEntry const* spellInfo = sSpellStore.LookupEntry(spellID);
+    if (!spellInfo)
+    {
+        return false;
+    }
+
+    if (!IsSpellAppliesAura(spellInfo, (1 << EFFECT_INDEX_0) | (1 << EFFECT_INDEX_1) | (1 << EFFECT_INDEX_2)) &&
+        !IsSpellHaveEffect(spellInfo, SPELL_EFFECT_PERSISTENT_AREA_AURA))
+    {
+        PSendSysMessage(LANG_SPELL_NO_HAVE_AURAS, spellID);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    SpellAuraHolder* holder = CreateSpellAuraHolder(spellInfo, target, m_session->GetPlayer());
+
+    for (uint32 i = 0; i < MAX_EFFECT_INDEX; ++i)
+    {
+        uint8 eff = spellInfo->Effect[i];
+        if (eff >= TOTAL_SPELL_EFFECTS)
+        {
+            continue;
+        }
+        if (IsAreaAuraEffect(eff) ||
+            eff == SPELL_EFFECT_APPLY_AURA ||
+            eff == SPELL_EFFECT_PERSISTENT_AREA_AURA)
+        {
+            Aura* aur = CreateAura(spellInfo, SpellEffectIndex(i), NULL, holder, target);
+            holder->AddAura(aur, SpellEffectIndex(i));
+        }
+    }
+    target->AddSpellAuraHolder(holder);
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleUnAuraCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleUnAuraCommand(char* args)
+{
+    Unit* target = getSelectedUnit();
+    if (!target)
+    {
+        SendSysMessage(LANG_SELECT_CHAR_OR_CREATURE);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    std::string argstr = args;
+    if (argstr == "all")
+    {
+        target->RemoveAllAuras();
+        return true;
+    }
+
+    // number or [name] Shift-click form |color|Hspell:spell_id|h[name]|h|r or Htalent form
+    uint32 spellID = ExtractSpellIdFromLink(&args);
+    if (!spellID)
+    {
+        return false;
+    }
+
+    target->RemoveAurasDueToSpell(spellID);
+
+    return true;
+}
+
+/**
+ * @brief Handler for HandleAuraGroupCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleAuraGroupCommand(char* args)
+{
+    // number or [name] Shift-click form |color|Hspell:spell_id|h[name]|h|r or Htalent form
+    uint32 spellID = ExtractSpellIdFromLink(&args);
+
+    SpellEntry const* spellInfo = sSpellStore.LookupEntry(spellID);
+    if (!spellInfo)
+    {
+        PSendSysMessage("Spell %u does not exists", spellID);
+        return false;
+    }
+
+    if (!IsSpellAppliesAura(spellInfo, (1 << EFFECT_INDEX_0) | (1 << EFFECT_INDEX_1) | (1 << EFFECT_INDEX_2)) &&
+        !IsSpellHaveEffect(spellInfo, SPELL_EFFECT_PERSISTENT_AREA_AURA))
+    {
+        PSendSysMessage(LANG_SPELL_NO_HAVE_AURAS, spellID);
+        SetSentErrorMessage(true);
+        return false;
+    }
+
+    Unit* rawTarget = getSelectedUnit();
+    Player* playerTarget ;
+
+    if (rawTarget)
+    {
+        if (rawTarget->GetTypeId() == TYPEID_UNIT)
+        {
+            SendSysMessage(LANG_NO_CHAR_SELECTED);
+            SetSentErrorMessage(true);
+            return false;
+        }
+
+        playerTarget = (Player*)rawTarget;
+    }
+    else
+    {
+        playerTarget = m_session->GetPlayer();
+    }
+
+
+    Group* grp = playerTarget->GetGroup();
+
+    if (!grp)
+    {
+        std::string nameLink = GetNameLink(playerTarget);
+
+        if (playerTarget->IsDead())
+        {
+            PSendSysMessage(LANG_COMMAND_AURAGROUP_CANNOT_APPLY_AURA_PLAYER_IS_DEAD, nameLink.c_str());
+            return false;
+        }
+        else
+        {
+            AddAuraToPlayer(spellInfo, playerTarget, m_session->GetPlayer());
+            PSendSysMessage(LANG_COMMAND_AURAGROUP_AURA_APPLIED, spellInfo->ID, nameLink.c_str());
+            return true;
+        }
+    }
+    else
+    {
+        // Apply to all members of the group
+        for (GroupReference* itr = grp->GetFirstMember(); itr != NULL; itr = itr->next())
+        {
+            Player* pl = itr->getSource();
+
+            //Skip if player is not found
+            if (!pl || !pl->GetSession())
+            {
+                continue;
+            }
+
+            std::string nameLink = GetNameLink(pl);
+
+            //skip if player is dead
+            if (pl->IsDead())
+            {
+                PSendSysMessage(LANG_COMMAND_AURAGROUP_CANNOT_APPLY_AURA_PLAYER_IS_DEAD, nameLink.c_str());
+                continue;
+            }
+
+            AddAuraToPlayer(spellInfo, pl, m_session->GetPlayer());
+            PSendSysMessage(LANG_COMMAND_AURAGROUP_AURA_APPLIED, spellInfo->ID, nameLink.c_str());
+
+         }
+
+         return true;
+    }
+}
+
+/**
+ * @brief Handler for HandleUnAuraGroupCommand command.
+ *
+ * @param args Command arguments.
+ * @returns True if the command executed successfully, false otherwise.
+ */
+bool ChatHandler::HandleUnAuraGroupCommand(char* args)
+{
+    // Must have args : spellId or "all"
+    if (!*args)
+    {
+        return false;
+    }
+
+    bool removeAll = false;
+
+    std::string argstr = args;
+    if (argstr == "all")
+    {
+        removeAll = true;
+    }
+
+    uint32 spellIdToRemove;
+
+    if (!removeAll)
+    {
+        spellIdToRemove = ExtractSpellIdFromLink(&args);
+        if (!spellIdToRemove)
+        {
+            return false;
+        }
+    }
+
+    // Now remove the aura(s)
+    Unit* rawTarget = getSelectedUnit();
+    Player* playerTarget;
+
+    if (rawTarget)
+    {
+        if (rawTarget->GetTypeId() == TYPEID_UNIT)
+        {
+            SendSysMessage(LANG_NO_CHAR_SELECTED);
+            SetSentErrorMessage(true);
+            return false;
+        }
+
+        playerTarget = (Player*)rawTarget;
+    }
+    else
+    {
+        playerTarget = m_session->GetPlayer();
+    }
+
+
+    Group* grp = playerTarget->GetGroup();
+
+    if (!grp)
+    {
+        std::string nameLink = GetNameLink(playerTarget);
+
+        //security : avoid to remove ghost form if player is dead
+        if (playerTarget->IsDead())
+        {
+            PSendSysMessage(LANG_COMMAND_AURAGROUP_CANNOT_UNAURA_DEAD_PLAYER, nameLink.c_str());
+            return false;
+        }
+        else
+        {
+            if (removeAll)
+            {
+                playerTarget->RemoveAllAuras();
+                PSendSysMessage(LANG_COMMAND_AURAGROUP_ALL_AURA_REMOVED, nameLink.c_str());
+            }
+            else
+            {
+                playerTarget->RemoveAurasDueToSpell(spellIdToRemove);
+                PSendSysMessage(LANG_COMMAND_AURAGROUP_AURA_REMOVED_FOR_SPELL, spellIdToRemove, nameLink.c_str());
+            }
+
+            return true;
+        }
+    }
+    else
+    {
+        // Apply to all members of the group
+        for (GroupReference* itr = grp->GetFirstMember(); itr != NULL; itr = itr->next())
+        {
+            Player* pl = itr->getSource();
+
+            if (!pl || !pl->GetSession())
+            {
+                continue;
+            }
+
+            std::string nameLink = GetNameLink(pl);
+            if (pl->IsDead())
+            {
+                PSendSysMessage(LANG_COMMAND_AURAGROUP_CANNOT_UNAURA_DEAD_PLAYER, nameLink.c_str());
+                continue;
+            }
+            else
+            {
+                if (removeAll)
+                {
+                    pl->RemoveAllAuras();
+                    PSendSysMessage(LANG_COMMAND_AURAGROUP_ALL_AURA_REMOVED, nameLink.c_str());
+                }
+                else
+                {
+                    pl->RemoveAurasDueToSpell(spellIdToRemove);
+                    PSendSysMessage(LANG_COMMAND_AURAGROUP_AURA_REMOVED_FOR_SPELL, spellIdToRemove, nameLink.c_str());
+                }
+
+            }
+
+        }
+
+        return true;
+    }
+}

@@ -1,0 +1,65 @@
+/**
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * MaNGOS is a full featured server for World of Warcraft, supporting
+ * the following clients: 1.12.x, 2.4.3, 3.3.5a, 4.3.4a and 5.4.8
+ *
+ * Copyright (C) 2005-2026 MaNGOS <https://www.getmangos.eu>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * World of Warcraft, and all World of Warcraft or Warcraft art, images,
+ * and lore are copyrighted by Blizzard Entertainment, Inc.
+ */
+
+#ifndef DURATION_H
+#define DURATION_H
+
+#include <chrono>
+
+/**
+ * @file Duration.h
+ * @brief Duration and time point type definitions
+ *
+ * Provides convenient typedefs for chrono duration types and time points,
+ * making time-related operations more readable and maintainable.
+ */
+
+ /// Milliseconds shorthand typedef.
+typedef std::chrono::milliseconds Milliseconds;
+
+/// Seconds shorthand typedef.
+typedef std::chrono::seconds Seconds;
+
+/// Minutes shorthand typedef.
+typedef std::chrono::minutes Minutes;
+
+/// Hours shorthand typedef.
+typedef std::chrono::hours Hours;
+
+/// time_point shorthand typedefs
+typedef std::chrono::steady_clock::time_point TimePoint;
+typedef std::chrono::system_clock::time_point SystemTimePoint;
+
+/**
+ * @brief User-defined literal for days
+ * @param days Number of days
+ * @return Hours equivalent (24 hours per day)
+ */
+constexpr std::chrono::hours operator "" _days(unsigned long long days)
+{
+    return std::chrono::hours(days * Hours(24));
+}
+
+#endif
