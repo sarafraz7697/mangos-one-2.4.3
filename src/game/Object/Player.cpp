@@ -392,6 +392,7 @@ UpdateMask Player::updateVisualBits;
 Player::Player(WorldSession* session): Unit(), m_petMgr(this), m_honorMgr(this), m_spellCooldownMgr(this), m_mover(this), m_camera(this), m_reputationMgr(this)
 {
     m_virtualVendorActive = false; // FAKE_INVENTORY_PATCH
+    m_virtualVendorReadOnly = false;
 #ifdef ENABLE_PLAYERBOTS
     m_playerbotAI = 0;
     m_playerbotMgr = 0;
@@ -4471,10 +4472,11 @@ void Player::ClearInventoryMenu()
     m_virtualVendorItems.Clear();
     m_virtualVendorPrices.clear();
     m_virtualVendorActive = false;
+    m_virtualVendorReadOnly = false;
 }
 
 // price == VIRTUAL_VENDOR_DEFAULT_PRICE -> use the item template BuyPrice
-void Player::AddInventoryMenuItem(uint32 item, uint32 price, uint32 extendedCost)
+void Player::AddInventoryMenuItem(uint32 item, uint32 price, uint32 extendedCost, uint32 stock)
 {
     if (!ObjectMgr::GetItemPrototype(item))
     {
@@ -4489,7 +4491,7 @@ void Player::AddInventoryMenuItem(uint32 item, uint32 price, uint32 extendedCost
             return;
         }
 
-        m_virtualVendorItems.AddItem(item, 0, 0, extendedCost, 0);   // maxcount 0 = unlimited
+        m_virtualVendorItems.AddItem(item, stock, 0, extendedCost, 0);   // maxcount = displayed stock (0 = unlimited)
     }
 
     if (price != VIRTUAL_VENDOR_DEFAULT_PRICE)
@@ -4502,8 +4504,9 @@ void Player::AddInventoryMenuItem(uint32 item, uint32 price, uint32 extendedCost
     }
 }
 
-void Player::SendInventoryMenu()
+void Player::SendInventoryMenu(bool readOnly)
 {
+    m_virtualVendorReadOnly = readOnly;
     m_virtualVendorActive = true;
     GetSession()->SendListInventory(GetObjectGuid());
 }
@@ -4541,6 +4544,14 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
 
     if (IsVirtualVendor(vendorGuid))
     {
+        if (m_virtualVendorReadOnly)
+        {
+            // display-only window: nothing can be bought
+            SendBuyError(BUY_ERR_CANT_FIND_ITEM, NULL, item, 0);
+            GetSession()->SendNotification("This window is for display only.");
+            return false;
+        }
+
         vItems = GetVirtualVendorItems();
     }
     else

@@ -1826,8 +1826,8 @@ class Player : public Unit
 
         // FAKE_INVENTORY_PATCH: fake inventory (vendor window without a creature)
         void ClearInventoryMenu();
-        void AddInventoryMenuItem(uint32 item, uint32 price, uint32 extendedCost = 0);
-        void SendInventoryMenu();
+        void AddInventoryMenuItem(uint32 item, uint32 price, uint32 extendedCost = 0, uint32 stock = 0);
+        void SendInventoryMenu(bool readOnly = false);
 
         bool IsVirtualVendor(ObjectGuid const& guid) const
         {
@@ -1854,6 +1854,7 @@ class Player : public Unit
         }
 
         bool m_virtualVendorActive;
+        bool m_virtualVendorReadOnly;   // display-only window: buying is refused
         VendorItemData m_virtualVendorItems;
         std::map<uint32, uint32> m_virtualVendorPrices;    // item -> price in copper (per BuyCount bundle)
 

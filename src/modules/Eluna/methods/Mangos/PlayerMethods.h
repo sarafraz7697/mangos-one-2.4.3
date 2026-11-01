@@ -2164,23 +2164,28 @@ namespace LuaPlayer
      * @param uint32 item : item entry
      * @param uint32 price = item BuyPrice : price in copper (per buy-count bundle)
      * @param uint32 extendedCost = 0 : ItemExtendedCost.dbc id
+     * @param uint32 stock = 0 : number shown on the item icon (0 = nothing shown)
      */
     int AddInventoryMenuItem(Eluna* E, Player* player)
     {
         uint32 item = E->CHECKVAL<uint32>(2);
         uint32 price = E->CHECKVAL<uint32>(3, 0xFFFFFFFF);
         uint32 extendedCost = E->CHECKVAL<uint32>(4, 0);
+        uint32 stock = E->CHECKVAL<uint32>(5, 0);
 
-        player->AddInventoryMenuItem(item, price, extendedCost);
+        player->AddInventoryMenuItem(item, price, extendedCost, stock);
         return 0;
     }
 
     /**
      * Sends the [Player]'s fake inventory as a vendor window. Works like GossipSendMenu.
+     * @param bool readOnly = false : true = display only, nothing can be bought
      */
     int SendInventoryMenu(Eluna* E, Player* player)
     {
-        player->SendInventoryMenu();
+        bool readOnly = E->CHECKVAL<bool>(2, false);
+
+        player->SendInventoryMenu(readOnly);
         return 0;
     }
 
