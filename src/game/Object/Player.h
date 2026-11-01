@@ -82,6 +82,7 @@
 #include "GMTicketMgr.h"
 
 #include<vector>
+#include "Creature.h"
 
 struct Mail;
 class Channel;
@@ -1822,6 +1823,39 @@ class Player : public Unit
 
         // Send a new item notification
         void SendNewItem(Item* item, uint32 count, bool received, bool created, bool broadcast = false, bool showInChat = true);
+
+        // FAKE_INVENTORY_PATCH: fake inventory (vendor window without a creature)
+        void ClearInventoryMenu();
+        void AddInventoryMenuItem(uint32 item, uint32 price, uint32 extendedCost = 0);
+        void SendInventoryMenu();
+
+        bool IsVirtualVendor(ObjectGuid const& guid) const
+        {
+            return m_virtualVendorActive && guid == GetObjectGuid();
+        }
+
+        // NULL when the fake inventory is empty
+        VendorItemData const* GetVirtualVendorItems() const
+        {
+            return m_virtualVendorItems.Empty() ? NULL : &m_virtualVendorItems;
+        }
+
+        // true (and sets price) only if the item has a custom price
+        bool GetVirtualVendorPrice(uint32 item, uint32& price) const
+        {
+            std::map<uint32, uint32>::const_iterator itr = m_virtualVendorPrices.find(item);
+            if (itr == m_virtualVendorPrices.end())
+            {
+                return false;
+            }
+
+            price = itr->second;
+            return true;
+        }
+
+        bool m_virtualVendorActive;
+        VendorItemData m_virtualVendorItems;
+        std::map<uint32, uint32> m_virtualVendorPrices;    // item -> price in copper (per BuyCount bundle)
 
         // Buy an item from a vendor
         bool BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, uint8 bag, uint8 slot);

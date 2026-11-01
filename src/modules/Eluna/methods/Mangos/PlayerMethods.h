@@ -2149,6 +2149,42 @@ namespace LuaPlayer
     }
 
     /**
+     * Clears the [Player]'s fake inventory (vendor window without an NPC).
+     * FAKE_INVENTORY_PATCH
+     */
+    int ClearInventoryMenu(Eluna* E, Player* player)
+    {
+        player->ClearInventoryMenu();
+        return 0;
+    }
+
+    /**
+     * Adds an item to the [Player]'s fake inventory.
+     *
+     * @param uint32 item : item entry
+     * @param uint32 price = item BuyPrice : price in copper (per buy-count bundle)
+     * @param uint32 extendedCost = 0 : ItemExtendedCost.dbc id
+     */
+    int AddInventoryMenuItem(Eluna* E, Player* player)
+    {
+        uint32 item = E->CHECKVAL<uint32>(2);
+        uint32 price = E->CHECKVAL<uint32>(3, 0xFFFFFFFF);
+        uint32 extendedCost = E->CHECKVAL<uint32>(4, 0);
+
+        player->AddInventoryMenuItem(item, price, extendedCost);
+        return 0;
+    }
+
+    /**
+     * Sends the [Player]'s fake inventory as a vendor window. Works like GossipSendMenu.
+     */
+    int SendInventoryMenu(Eluna* E, Player* player)
+    {
+        player->SendInventoryMenu();
+        return 0;
+    }
+
+    /**
      * Sends a vendor window to the [Player] from the [WorldObject] specified.
      *
      * @param [WorldObject] sender
@@ -3953,6 +3989,9 @@ namespace LuaPlayer
         { "LogoutPlayer", &LuaPlayer::LogoutPlayer },
         { "SendTrainerList", &LuaPlayer::SendTrainerList },
         { "SendListInventory", &LuaPlayer::SendListInventory },
+        { "ClearInventoryMenu", &LuaPlayer::ClearInventoryMenu }, // FAKE_INVENTORY_PATCH
+        { "AddInventoryMenuItem", &LuaPlayer::AddInventoryMenuItem },
+        { "SendInventoryMenu", &LuaPlayer::SendInventoryMenu },
         { "SendShowBank", &LuaPlayer::SendShowBank },
         { "SendTabardVendorActivate", &LuaPlayer::SendTabardVendorActivate },
         { "SendSpiritResurrect", &LuaPlayer::SendSpiritResurrect },
