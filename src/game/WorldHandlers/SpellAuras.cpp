@@ -2689,6 +2689,15 @@ void Aura::PeriodicTick()
 
             pdamage = target->SpellHealingBonusTaken(pCaster, spellProto, pdamage, DOT, GetStackAmount());
 
+            // [heal rate mod] Final healing multiplier for heal over time ticks (Renew,
+            // Rejuvenation, Lifebloom, bandages, ...). Only healing done by players and
+            // player controlled units (pets, totems, charmed units) is scaled, healing
+            // done by creatures is never affected.
+            if (pdamage > 0 && pCaster->IsControlledByPlayer())
+            {
+                pdamage = uint32(pdamage * sWorld.getConfig(CONFIG_FLOAT_RATE_HEALING));
+            }
+
             DETAIL_FILTER_LOG(LOG_FILTER_PERIODIC_AFFECTS, "PeriodicTick: %s heal of %s for %u health inflicted by %u",
                               GetCasterGuid().GetString().c_str(), target->GetGuidStr().c_str(), pdamage, GetId());
 

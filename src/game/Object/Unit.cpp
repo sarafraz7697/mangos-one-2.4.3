@@ -3522,6 +3522,15 @@ void Unit::UnsummonAllTotems()
  */
 int32 Unit::DealHeal(Unit* pVictim, uint32 addhealth, SpellEntry const* spellProto, bool critical)
 {
+    // [heal rate mod] Final healing multiplier for all direct heals (incl. crits),
+    // percent heals, drains/leeches, potions, healthstones and triggered heals.
+    // Only healing done by players and player controlled units (pets, totems,
+    // charmed units) is scaled, healing done by creatures is never affected.
+    if (addhealth > 0 && IsControlledByPlayer())
+    {
+        addhealth = uint32(addhealth * sWorld.getConfig(CONFIG_FLOAT_RATE_HEALING));
+    }
+
     int32 gain = pVictim->ModifyHealth(int32(addhealth));
 
     Unit* unit = this;

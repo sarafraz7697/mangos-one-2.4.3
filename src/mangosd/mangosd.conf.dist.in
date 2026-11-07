@@ -1101,6 +1101,19 @@ LivingWorld.AnchorPolicyMask              = 0
 #        done by creatures is not affected (use Rate.Creature.* for that).
 #        Default: 1     - off (original damage)
 #
+#    Rate.Healing
+#        Final healing multiplier. Scales all healing done by players and their
+#        pets/totems: direct heals and heal crits, heal over time ticks (Renew,
+#        Rejuvenation, Lifebloom, bandages), percent heals, drains and leeches
+#        (Drain Life, Siphon Life, Death Coil, Vampiric Embrace), potions and
+#        healthstones. Use it together with the Rate.Damage.* options to balance
+#        healing output against damage output.
+#        NOTE: only healing DONE BY players and their pets/totems is scaled. Healing
+#        done by creatures is not affected. Heal crit chance already follows
+#        Rate.CritChance.Spell. Natural health regeneration is not affected (use
+#        the existing Rate.Health option for that).
+#        Default: 1     - off (original healing)
+#
 #    Creature.DisplayHealthAsPercent
 #        Creatures send their health and mana to clients as percentage (0-100) instead
 #        of real values, so target frames and nameplates show percent bars. Players,
@@ -1217,6 +1230,7 @@ Rate.CritChance.Spell                     = 10.0
 Rate.Damage.Melee                         = 1.0
 Rate.Damage.Ranged                        = 1.0
 Rate.Damage.Spell                         = 1.0
+Rate.Healing                              = 1.0
 Creature.DisplayHealthAsPercent           = 1
 Rate.Creature.Aggro                       = 1
 CreatureRespawnAggroDelay                 = 5000

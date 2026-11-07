@@ -202,7 +202,15 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
         // Do triggers for unit (reflect triggers passed on hit phase for correct drop charge)
         if (m_canTrigger && missInfo != SPELL_MISS_REFLECT)
         {
-            caster->ProcDamageAndSpell(unitTarget, real_caster ? procAttacker : uint32(PROC_FLAG_NONE), procVictim, procEx, addhealth, m_attackType, m_spellInfo);
+            // [heal rate mod] keep proc amounts in sync with the scaled heal below
+            // (e.g. Spiritual Attunement mana gain from heals received)
+            uint32 procHeal = addhealth;
+            if (caster->IsControlledByPlayer())
+            {
+                procHeal = uint32(procHeal * sWorld.getConfig(CONFIG_FLOAT_RATE_HEALING));
+            }
+
+            caster->ProcDamageAndSpell(unitTarget, real_caster ? procAttacker : uint32(PROC_FLAG_NONE), procVictim, procEx, procHeal, m_attackType, m_spellInfo);
         }
 
         int32 gain = caster->DealHeal(unitTarget, addhealth, m_spellInfo, crit);

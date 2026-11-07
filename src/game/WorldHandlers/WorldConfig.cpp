@@ -655,6 +655,7 @@ void World::LoadConfigSettings(bool reload)
     setConfigMinMax(CONFIG_FLOAT_RATE_DAMAGE_MELEE,        "Rate.Damage.Melee",        1.0f, 0.0f, 100.0f);
     setConfigMinMax(CONFIG_FLOAT_RATE_DAMAGE_RANGED,       "Rate.Damage.Ranged",       1.0f, 0.0f, 100.0f);
     setConfigMinMax(CONFIG_FLOAT_RATE_DAMAGE_SPELL,        "Rate.Damage.Spell",        1.0f, 0.0f, 100.0f);
+    setConfigMinMax(CONFIG_FLOAT_RATE_HEALING,             "Rate.Healing",             1.0f, 0.0f, 100.0f);
     setConfig(CONFIG_BOOL_CREATURE_HEALTH_AS_PERCENT, "Creature.DisplayHealthAsPercent", true);
 
 #ifdef ENABLE_PLAYERBOTS
