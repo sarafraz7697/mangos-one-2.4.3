@@ -2501,6 +2501,27 @@ void Aura::PeriodicTick()
             uint32 procVictim   = PROC_FLAG_ON_TAKE_PERIODIC;// | PROC_FLAG_TAKEN_HARMFUL_SPELL_HIT;
             pdamage = (pdamage <= absorb + resist) ? 0 : (pdamage - absorb - resist);
 
+            // [damage rate mod] Final damage multiplier per damage type for damage over
+            // time ticks. Only damage done by players and player controlled units (pets,
+            // totems, charmed units) is scaled, creature damage is never affected.
+            if (pdamage > 0 && pCaster->IsControlledByPlayer())
+            {
+                float damageRate = 1.0f;
+                switch (spellProto->DefenseType)
+                {
+                    case SPELL_DAMAGE_CLASS_RANGED:
+                        damageRate = sWorld.getConfig(CONFIG_FLOAT_RATE_DAMAGE_RANGED);
+                        break;
+                    case SPELL_DAMAGE_CLASS_MELEE:
+                        damageRate = sWorld.getConfig(CONFIG_FLOAT_RATE_DAMAGE_MELEE);
+                        break;
+                    default:
+                        damageRate = sWorld.getConfig(CONFIG_FLOAT_RATE_DAMAGE_SPELL);
+                        break;
+                }
+                pdamage = uint32(pdamage * damageRate);
+            }
+
             SpellPeriodicAuraLogInfo pInfo(this, pdamage, absorb, resist, 0.0f);
             target->SendPeriodicAuraLog(&pInfo);
 

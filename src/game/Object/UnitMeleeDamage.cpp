@@ -350,6 +350,17 @@ void Unit::CalculateMeleeDamage(Unit* pVictim, CalcDamageInfo* damageInfo, Weapo
     {
         damageInfo->damage = 0;
     }
+
+    // [damage rate mod] Final damage multiplier per weapon attack type (melee swings
+    // vs ranged auto shots). Only damage done by players and player controlled units
+    // (pets, totems, charmed units) is scaled, creature damage is never affected.
+    if (damageInfo->damage > 0 && IsControlledByPlayer())
+    {
+        float damageRate = attackType == RANGED_ATTACK
+                               ? sWorld.getConfig(CONFIG_FLOAT_RATE_DAMAGE_RANGED)
+                               : sWorld.getConfig(CONFIG_FLOAT_RATE_DAMAGE_MELEE);
+        damageInfo->damage = uint32(damageInfo->damage * damageRate);
+    }
 }
 
 /**

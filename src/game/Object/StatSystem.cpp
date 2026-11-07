@@ -587,10 +587,13 @@ void Player::UpdateCritPercentage(WeaponAttackType attType)
     value += (int32(GetWeaponSkillValue(attType)) - int32(GetMaxSkillValueForLevel())) * 0.04f;
     value = value < 0.0f ? 0.0f : value;
 
-    // [crit multiplier mod] Scale the final chance (base crit, gear, talents and buffs are
+    // [crit rate mod] Scale the final chance (base crit, gear, talents and buffs are
     // all multiplied) and cap at 100%. The character sheet reads this field, so the panel
-    // always shows the same chance the combat rolls actually use.
-    value *= sWorld.getConfig(CONFIG_FLOAT_RATE_CRIT_CHANCE_MULTIPLIER);
+    // always shows the same chance the combat rolls actually use. Melee (main/off hand)
+    // and ranged use separate configured multipliers.
+    value *= sWorld.getConfig(attType == RANGED_ATTACK
+                                  ? CONFIG_FLOAT_RATE_CRIT_CHANCE_RANGED
+                                  : CONFIG_FLOAT_RATE_CRIT_CHANCE_MELEE);
     if (value > 100.0f)
     {
         value = 100.0f;
@@ -678,9 +681,9 @@ void Player::UpdateSpellCritChance(uint32 school)
     // Increase crit from spell crit ratings
     crit += GetRatingBonusValue(CR_CRIT_SPELL);
 
-    // [crit multiplier mod] Scale the final chance and cap at 100%. The character sheet
+    // [crit rate mod] Scale the final chance and cap at 100%. The character sheet
     // reads this field, so the panel always shows the chance the combat rolls actually use.
-    crit *= sWorld.getConfig(CONFIG_FLOAT_RATE_CRIT_CHANCE_MULTIPLIER);
+    crit *= sWorld.getConfig(CONFIG_FLOAT_RATE_CRIT_CHANCE_SPELL);
     if (crit > 100.0f)
     {
         crit = 100.0f;

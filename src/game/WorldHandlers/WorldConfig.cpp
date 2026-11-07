@@ -649,7 +649,12 @@ void World::LoadConfigSettings(bool reload)
 
     setConfig(CONFIG_BOOL_ENABLE_QUEST_TRACKER,        "QuestTracker.Enable", 0);
 
-    setConfigMinMax(CONFIG_FLOAT_RATE_CRIT_CHANCE_MULTIPLIER, "Rate.CritChance.Multiplier", 10.0f, 0.0f, 100.0f);
+    setConfigMinMax(CONFIG_FLOAT_RATE_CRIT_CHANCE_MELEE,   "Rate.CritChance.Melee",   10.0f, 0.0f, 100.0f);
+    setConfigMinMax(CONFIG_FLOAT_RATE_CRIT_CHANCE_RANGED,  "Rate.CritChance.Ranged",  10.0f, 0.0f, 100.0f);
+    setConfigMinMax(CONFIG_FLOAT_RATE_CRIT_CHANCE_SPELL,   "Rate.CritChance.Spell",   10.0f, 0.0f, 100.0f);
+    setConfigMinMax(CONFIG_FLOAT_RATE_DAMAGE_MELEE,        "Rate.Damage.Melee",        1.0f, 0.0f, 100.0f);
+    setConfigMinMax(CONFIG_FLOAT_RATE_DAMAGE_RANGED,       "Rate.Damage.Ranged",       1.0f, 0.0f, 100.0f);
+    setConfigMinMax(CONFIG_FLOAT_RATE_DAMAGE_SPELL,        "Rate.Damage.Spell",        1.0f, 0.0f, 100.0f);
     setConfig(CONFIG_BOOL_CREATURE_HEALTH_AS_PERCENT, "Creature.DisplayHealthAsPercent", true);
 
 #ifdef ENABLE_PLAYERBOTS

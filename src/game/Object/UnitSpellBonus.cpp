@@ -460,9 +460,9 @@ bool Unit::IsSpellCrit(Unit* pVictim, SpellEntry const* spellProto, SpellSchoolM
                 crit_chance = float(m_baseSpellCritChance);
                 crit_chance += GetTotalAuraModifierByMiscMask(SPELL_AURA_MOD_SPELL_CRIT_CHANCE_SCHOOL, schoolMask);
 
-                // [crit multiplier mod] creatures use the configured multiplier on their
+                // [crit rate mod] creatures use the configured multiplier on their
                 // spell crit (players use the already multiplied character sheet fields)
-                crit_chance *= sWorld.getConfig(CONFIG_FLOAT_RATE_CRIT_CHANCE_MULTIPLIER);
+                crit_chance *= sWorld.getConfig(CONFIG_FLOAT_RATE_CRIT_CHANCE_SPELL);
             }
             // taken
             if (pVictim)

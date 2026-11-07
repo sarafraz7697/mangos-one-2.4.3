@@ -1074,13 +1074,32 @@ LivingWorld.AnchorPolicyMask              = 0
 ################################################################################
 # CREATURE AND GAMEOBJECT SETTINGS
 #
-#    Rate.CritChance.Multiplier
-#        Multiplier applied to the final critical strike chance of every melee, ranged
-#        and spell attack of players and creatures (base crit, gear, talents and buffs
-#        are all multiplied). The result is capped at 100% and the same value is shown
-#        in the character sheet, so the panel always matches the real rolls.
+#    Rate.CritChance.Melee
+#    Rate.CritChance.Ranged
+#    Rate.CritChance.Spell
+#        Multiplier applied to the final critical strike chance per attack type of
+#        players and creatures (base crit, gear, talents and buffs are all multiplied).
+#        Melee covers main hand, off hand and weapon based melee abilities, Ranged
+#        covers auto shot and hunter shots, Spell covers magic damage and heals.
+#        The result is capped at 100% and the same value is shown in the character
+#        sheet, so the panel always matches the real rolls.
 #        Default: 10    - (9% crit from gear => 90% crit chance)
 #                 1.0   - off (original chances)
+#
+#    Rate.Damage.Melee
+#    Rate.Damage.Ranged
+#    Rate.Damage.Spell
+#        Final damage multiplier per damage type. Use these to balance the damage
+#        output of the classes, e.g. if mage spells hit for ~4k while melee classes
+#        only reach ~1k, lower Rate.Damage.Spell and/or raise Rate.Damage.Melee
+#        until the numbers line up.
+#        Melee: white hits and weapon based melee abilities (warrior, rogue,
+#        paladin swings and abilities).
+#        Ranged: auto shot and hunter shots.
+#        Spell: magic damage spells and damage over time ticks.
+#        NOTE: only damage DONE BY players and their pets/totems is scaled. Damage
+#        done by creatures is not affected (use Rate.Creature.* for that).
+#        Default: 1     - off (original damage)
 #
 #    Creature.DisplayHealthAsPercent
 #        Creatures send their health and mana to clients as percentage (0-100) instead
@@ -1192,7 +1211,12 @@ LivingWorld.AnchorPolicyMask              = 0
 ################################################################################
 
 ThreatRadius                              = 100
-Rate.CritChance.Multiplier                = 10.0
+Rate.CritChance.Melee                     = 10.0
+Rate.CritChance.Ranged                    = 10.0
+Rate.CritChance.Spell                     = 10.0
+Rate.Damage.Melee                         = 1.0
+Rate.Damage.Ranged                        = 1.0
+Rate.Damage.Spell                         = 1.0
 Creature.DisplayHealthAsPercent           = 1
 Rate.Creature.Aggro                       = 1
 CreatureRespawnAggroDelay                 = 5000

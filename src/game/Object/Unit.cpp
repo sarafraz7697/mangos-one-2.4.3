@@ -1868,6 +1868,29 @@ void Unit::CalculateSpellDamage(SpellNonMeleeDamage* damageInfo, int32 damage, S
     {
         damage = 0;
     }
+
+    // [damage rate mod] Final damage multiplier per damage type. Weapon based spells
+    // (DefenseType MELEE/RANGED, e.g. warrior/rogue abilities, hunter shots and auto
+    // shot) use the weapon rates, magic damage uses the spell rate. Only damage done
+    // by players and player controlled units (pets, totems, charmed units) is scaled,
+    // creature damage is never affected.
+    if (damage > 0 && IsControlledByPlayer())
+    {
+        float damageRate = 1.0f;
+        switch (spellInfo->DefenseType)
+        {
+            case SPELL_DAMAGE_CLASS_RANGED:
+                damageRate = sWorld.getConfig(CONFIG_FLOAT_RATE_DAMAGE_RANGED);
+                break;
+            case SPELL_DAMAGE_CLASS_MELEE:
+                damageRate = sWorld.getConfig(CONFIG_FLOAT_RATE_DAMAGE_MELEE);
+                break;
+            default:
+                damageRate = sWorld.getConfig(CONFIG_FLOAT_RATE_DAMAGE_SPELL);
+                break;
+        }
+        damage = int32(damage * damageRate);
+    }
     damageInfo->damage = damage;
 }
 

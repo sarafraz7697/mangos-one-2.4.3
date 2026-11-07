@@ -1187,8 +1187,10 @@ float Unit::GetUnitCriticalChance(WeaponAttackType attackType, const Unit* pVict
         crit = 5.0f;
         crit += GetTotalAuraModifier(SPELL_AURA_MOD_CRIT_PERCENT);
 
-        // [crit multiplier mod] creatures use the configured multiplier on their crit
-        crit *= sWorld.getConfig(CONFIG_FLOAT_RATE_CRIT_CHANCE_MULTIPLIER);
+        // [crit rate mod] creatures use the configured multiplier on their crit
+        crit *= sWorld.getConfig(attackType == RANGED_ATTACK
+                                     ? CONFIG_FLOAT_RATE_CRIT_CHANCE_RANGED
+                                     : CONFIG_FLOAT_RATE_CRIT_CHANCE_MELEE);
     }
 
     // flat aura mods
