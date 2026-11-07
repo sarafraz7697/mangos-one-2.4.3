@@ -1114,6 +1114,20 @@ LivingWorld.AnchorPolicyMask              = 0
 #        the existing Rate.Health option for that).
 #        Default: 1     - off (original healing)
 #
+#    ItemVisual.Enable
+#        Master switch for the item visual override system (temporary
+#        transmogrification-like display changes of equipped items). When
+#        disabled, all item display override requests fail. The value is read
+#        live, so it can be changed at runtime with .reload config / SIGHUP.
+#        Display override inputs are universal: an item entry (for example a
+#        creature_equip_template.equipentry1-3 value), a display id that items
+#        use (item_template.displayid) or any raw display id (for example a
+#        creature_equip_template_raw.equipmodel1-3 value - a synthetic
+#        display-only item is shown for it). Raw display ids must exist in
+#        the client's ItemDisplayInfo.dbc to be visible.
+#        Default: 1   - enabled
+#                 0   - disabled
+#
 #    Creature.DisplayHealthAsPercent
 #        Creatures send their health and mana to clients as percentage (0-100) instead
 #        of real values, so target frames and nameplates show percent bars. Players,
@@ -1231,6 +1245,7 @@ Rate.Damage.Melee                         = 1.0
 Rate.Damage.Ranged                        = 1.0
 Rate.Damage.Spell                         = 1.0
 Rate.Healing                              = 1.0
+ItemVisual.Enable                         = 1
 Creature.DisplayHealthAsPercent           = 1
 Rate.Creature.Aggro                       = 1
 CreatureRespawnAggroDelay                 = 5000

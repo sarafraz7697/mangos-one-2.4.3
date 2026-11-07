@@ -393,6 +393,10 @@ Player::Player(WorldSession* session): Unit(), m_petMgr(this), m_honorMgr(this),
 {
     m_virtualVendorActive = false; // FAKE_INVENTORY_PATCH
     m_virtualVendorReadOnly = false;
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot) // ITEM_VISUAL_PATCH
+    {
+        m_itemVisualOverrideEntries[slot] = 0;
+    }
 #ifdef ENABLE_PLAYERBOTS
     m_playerbotAI = 0;
     m_playerbotMgr = 0;

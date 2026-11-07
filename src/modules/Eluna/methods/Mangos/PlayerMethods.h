@@ -2190,6 +2190,58 @@ namespace LuaPlayer
     }
 
     /**
+     * Morphs the visible look of the first equipped [Item] with the given entry.
+     * ITEM_VISUAL_PATCH: temporary transmogrification-like display override.
+     *
+     * The change is visible to everyone immediately (like .morph). It is session
+     * only: nothing is saved and it disappears on logout/login. Stats, enchants,
+     * tooltips and inspection keep using the real item.
+     *
+     * @param uint32 itemId : equipped item entry to change
+     * @param uint32 displayId : display id (ItemDisplayInfo.dbc - raw ids such as creature_equip_template_raw.equipmodel values work) or an item entry (e.g. a creature_equip_template.equipentry value), 0 restores the real look
+     * @return bool applied
+     */
+    int ItemMorph(Eluna* E, Player* player)
+    {
+        uint32 itemEntry = E->CHECKVAL<uint32>(2);
+        uint32 displayId = E->CHECKVAL<uint32>(3);
+
+        E->Push(player->SetItemVisualOverrideByItemEntry(itemEntry, displayId));
+        return 1;
+    }
+
+    /**
+     * Morphs the visible look of the [Item] in the given equipment slot.
+     * ITEM_VISUAL_PATCH: temporary transmogrification-like display override.
+     *
+     * Slots: 0 head, 1 neck, 2 shoulders, 3 body(shirt), 4 chest, 5 waist,
+     * 6 legs, 7 feet, 8 wrists, 9 hands, 10 finger1, 11 finger2, 12 trinket1,
+     * 13 trinket2, 14 back, 15 main hand, 16 off hand, 17 ranged, 18 tabard.
+     *
+     * @param uint8 slot : equipment slot
+     * @param uint32 displayId : display id (ItemDisplayInfo.dbc - raw ids such as creature_equip_template_raw.equipmodel values work) or an item entry (e.g. a creature_equip_template.equipentry value), 0 restores the real look
+     * @return bool applied
+     */
+    int ItemMorphSlot(Eluna* E, Player* player)
+    {
+        uint8 slot = E->CHECKVAL<uint8>(2);
+        uint32 displayId = E->CHECKVAL<uint32>(3);
+
+        E->Push(player->SetItemVisualOverride(slot, displayId));
+        return 1;
+    }
+
+    /**
+     * Restores the real look of every morphed equipment slot of the [Player].
+     * ITEM_VISUAL_PATCH
+     */
+    int ItemMorphReset(Eluna* E, Player* player)
+    {
+        player->ResetItemVisualOverrides();
+        return 0;
+    }
+
+    /**
      * Sends a vendor window to the [Player] from the [WorldObject] specified.
      *
      * @param [WorldObject] sender
@@ -3997,6 +4049,9 @@ namespace LuaPlayer
         { "ClearInventoryMenu", &LuaPlayer::ClearInventoryMenu }, // FAKE_INVENTORY_PATCH
         { "AddInventoryMenuItem", &LuaPlayer::AddInventoryMenuItem },
         { "SendInventoryMenu", &LuaPlayer::SendInventoryMenu },
+        { "ItemMorph", &LuaPlayer::ItemMorph }, // ITEM_VISUAL_PATCH
+        { "ItemMorphSlot", &LuaPlayer::ItemMorphSlot },
+        { "ItemMorphReset", &LuaPlayer::ItemMorphReset },
         { "SendShowBank", &LuaPlayer::SendShowBank },
         { "SendTabardVendorActivate", &LuaPlayer::SendTabardVendorActivate },
         { "SendSpiritResurrect", &LuaPlayer::SendSpiritResurrect },

@@ -236,6 +236,18 @@ int32 Eluna::OnBuyItem(Player* pPlayer, Creature* pVendor, uint32 itemEntry, uin
     CleanUpStack(4);
     return result;
 }
+// Lets a Lua handler deny an item visual change (ITEM_VISUAL_PATCH).
+// Returns false when any handler refused the change, true otherwise.
+// A handler refuses by returning false.
+bool Eluna::OnItemMorph(Player* pPlayer, uint8 slot, uint32 itemEntry, uint32 displayId)
+{
+    START_HOOK_WITH_RETVAL(PLAYER_EVENT_ON_ITEM_MORPH, true);
+    HookPush(pPlayer);
+    HookPush(slot);
+    HookPush(itemEntry);
+    HookPush(displayId);
+    return CallAllFunctionsBool(binding, key, true);
+}
 void Eluna::OnPlayerEnterCombat(Player* pPlayer, Unit* pEnemy)
 {
     START_HOOK(PLAYER_EVENT_ON_ENTER_COMBAT);

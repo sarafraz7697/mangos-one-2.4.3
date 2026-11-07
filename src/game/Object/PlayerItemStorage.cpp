@@ -31,6 +31,7 @@
 #include "WorldPacket.h"
 #include "WorldSession.h"
 #include "ObjectMgr.h"
+#include "World.h"
 #include "Database/DatabaseEnv.h"
 #include "DBCStores.h"
 #ifdef ENABLE_ELUNA
@@ -398,7 +399,19 @@ void Player::SetVisibleItemSlot(uint8 slot, Item* pItem)
         SetGuidValue(PLAYER_VISIBLE_ITEM_1_CREATOR + (slot * MAX_VISIBLE_ITEM_OFFSET), pItem->GetGuidValue(ITEM_FIELD_CREATOR));
 
         int VisibleBase = PLAYER_VISIBLE_ITEM_1_0 + (slot * MAX_VISIBLE_ITEM_OFFSET);
-        SetUInt32Value(VisibleBase + 0, pItem->GetEntry());
+
+        // [item visual override] send the overridden item entry instead of the real one,
+        // so re-equipping keeps the changed look until logout (the override is never saved).
+        // Honored only while the system is enabled, so flipping ItemVisual.Enable off
+        // restores the real look on the next equip/unequip of the slot.
+        uint32 visibleEntry = pItem->GetEntry();
+        if (slot < EQUIPMENT_SLOT_END && m_itemVisualOverrideEntries[slot] &&
+                sWorld.getConfig(CONFIG_BOOL_ITEM_VISUAL_OVERRIDE_ENABLE))
+        {
+            visibleEntry = m_itemVisualOverrideEntries[slot];
+        }
+
+        SetUInt32Value(VisibleBase + 0, visibleEntry);
 
         for (int i = 0; i < MAX_INSPECTED_ENCHANTMENT_SLOT; ++i)
         {
@@ -423,6 +436,147 @@ void Player::SetVisibleItemSlot(uint8 slot, Item* pItem)
 
         SetUInt32Value(PLAYER_VISIBLE_ITEM_1_PROPERTIES + 0 + (slot * MAX_VISIBLE_ITEM_OFFSET), 0);
         SetUInt32Value(PLAYER_VISIBLE_ITEM_1_PROPERTIES + 1 + (slot * MAX_VISIBLE_ITEM_OFFSET), 0);
+    }
+}
+
+/**
+ * @brief Changes the displayed look of one equipped item, for everyone in range.
+ *
+ * The override is temporary: it lives only in this session (this Player object),
+ * it is never written to the database and it disappears on logout/login. The
+ * change is broadcast immediately through the PLAYER_VISIBLE_ITEM update
+ * fields, the same mechanism .morph uses for creature models. Enchant glows,
+ * the real item stats, tooltips and inspection keep working from the real item.
+ *
+ * @param slot The equipment slot to change (0-18).
+ * @param displayId The display to show: an ItemDisplayInfo.dbc id (raw ids such
+ *                  as the equipmodel values of creature_equip_template_raw work)
+ *                  or an item entry (for example a creature_equip_template
+ *                  .equipentry value). 0 restores the real look.
+ * @return true when the override was applied (or restored).
+ */
+bool Player::SetItemVisualOverride(uint8 slot, uint32 displayId)
+{
+    if (slot >= EQUIPMENT_SLOT_END)
+    {
+        return false;
+    }
+
+    Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+
+    // displayId 0 = remove the override and show the real item again.
+    // Resetting is always allowed, even while the system is disabled.
+    if (displayId == 0)
+    {
+        m_itemVisualOverrideEntries[slot] = 0;
+        SetVisibleItemSlot(slot, pItem);
+        return true;
+    }
+
+    if (!sWorld.getConfig(CONFIG_BOOL_ITEM_VISUAL_OVERRIDE_ENABLE))
+    {
+        return false;
+    }
+
+    if (!pItem)
+    {
+        return false;                                   // nothing equipped in this slot
+    }
+
+    // Used by Eluna: a Lua handler of PLAYER_EVENT_ON_ITEM_MORPH can deny the change
+#ifdef ENABLE_ELUNA
+    if (Eluna* e = GetEluna())
+    {
+        if (!e->OnItemMorph(this, slot, pItem->GetEntry(), displayId))
+        {
+            return false;
+        }
+    }
+#endif /* ENABLE_ELUNA */
+
+    // The client renders gear from the item entry, so the input must become an
+    // item entry. Slot fitting is NOT validated on purpose (system method).
+    // Accepted inputs, resolved in this order:
+    //   1. an item entry - for example a creature_equip_template.equipentry1-3
+    //      value: show that item itself,
+    //   2. a display id that items use - an item_template.displayid value:
+    //      show the lowest item with that display,
+    //   3. any other display id - for example a creature_equip_template_raw
+    //      .equipmodel1-3 value: show a synthetic display-only item created on
+    //      the fly and delivered to clients through their item queries.
+    uint32 overrideEntry = 0;
+    ItemPrototype const* fakeProto = NULL;
+    if (ItemPrototype const* inputProto = ObjectMgr::GetItemPrototype(displayId))
+    {
+        overrideEntry = inputProto->ItemId;              // input is an item entry
+    }
+    else if (uint32 itemEntry = ObjectMgr::GetFirstItemEntryForDisplay(displayId))
+    {
+        overrideEntry = itemEntry;                       // input is a display id some item uses
+    }
+    else
+    {
+        fakeProto = ObjectMgr::GetOrCreateItemVisualFakePrototype(displayId, pItem->GetProto());
+        if (fakeProto)
+        {
+            overrideEntry = fakeProto->ItemId;           // synthetic item for a raw display id
+        }
+    }
+
+    if (!overrideEntry)
+    {
+        return false;                                    // no way to show this id
+    }
+
+    // Push the item data before the visible update, so the client already knows
+    // the model the moment the override entry arrives (other players receive it
+    // through their normal item queries).
+    ItemPrototype const* pushProto = fakeProto ? fakeProto : ObjectMgr::GetItemPrototype(overrideEntry);
+    if (pushProto && GetSession())
+    {
+        GetSession()->SendItemQuerySingleResponse(pushProto);
+    }
+
+    m_itemVisualOverrideEntries[slot] = overrideEntry;
+    SetUInt32Value(PLAYER_VISIBLE_ITEM_1_0 + (slot * MAX_VISIBLE_ITEM_OFFSET), overrideEntry);
+    return true;
+}
+
+/**
+ * @brief Changes the displayed look of the first equipment slot holding an item.
+ *
+ * @param itemEntry The equipped item entry to look for.
+ * @param displayId The display to show (display id or item entry, see
+ *                  SetItemVisualOverride), 0 restores the real look.
+ * @return true when the override was applied (or the item was not found and a
+ *         reset was requested).
+ */
+bool Player::SetItemVisualOverrideByItemEntry(uint32 itemEntry, uint32 displayId)
+{
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+    {
+        Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (pItem && pItem->GetEntry() == itemEntry)
+        {
+            return SetItemVisualOverride(slot, displayId);
+        }
+    }
+
+    return false;
+}
+
+/**
+ * @brief Restores the real look of every overridden equipment slot.
+ */
+void Player::ResetItemVisualOverrides()
+{
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+    {
+        if (m_itemVisualOverrideEntries[slot])
+        {
+            m_itemVisualOverrideEntries[slot] = 0;
+            SetVisibleItemSlot(slot, GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+        }
     }
 }
 

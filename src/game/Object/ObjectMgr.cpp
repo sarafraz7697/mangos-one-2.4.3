@@ -26,6 +26,7 @@
 #include "Common/Locales.h"
 #include "Utilities/Errors.h"
 #include <algorithm>
+#include <mutex>
 #include <sstream>
 #include "Utilities/PackedValues.h"
 #include "ObjectMgr.h"
@@ -614,6 +615,131 @@ CreatureDataAddon const* ObjectMgr::GetCreatureTemplateAddon(uint32 entry) { ret
  * @return The item prototype, or null if missing.
  */
 ItemPrototype const* ObjectMgr::GetItemPrototype(uint32 id) { return sItemStorage.LookupEntry<ItemPrototype>(id); }
+
+/**
+ * @brief Resolves an ItemDisplayInfo.dbc display id to an item entry.
+ *
+ * Used by the item visual override system: player gear visuals are driven by the
+ * item entry in the PLAYER_VISIBLE_ITEM update fields, so a display change is
+ * applied by sending the entry of another item that uses the wanted display.
+ * The lowest matching entry wins; which slot it belongs to is NOT validated.
+ *
+ * @param displayId The ItemDisplayInfo.dbc id.
+ * @return The lowest item entry with this display, 0 when no item uses it.
+ */
+uint32 ObjectMgr::GetFirstItemEntryForDisplay(uint32 displayId)
+{
+    // displayId -> lowest item entry, built on first use (world thread only)
+    typedef std::map<uint32, uint32> ItemDisplayIndexMap;
+    static ItemDisplayIndexMap displayToEntry;
+    static bool indexed = false;
+
+    if (!indexed)
+    {
+        for (uint32 entry = 1; entry < sItemStorage.GetMaxEntry(); ++entry)
+        {
+            ItemPrototype const* proto = sItemStorage.LookupEntry<ItemPrototype>(entry);
+            if (!proto || !proto->DisplayInfoID)
+            {
+                continue;
+            }
+
+            ItemDisplayIndexMap::iterator itr = displayToEntry.find(proto->DisplayInfoID);
+            if (itr == displayToEntry.end())
+            {
+                displayToEntry.insert(std::make_pair(proto->DisplayInfoID, entry));
+            }
+        }
+
+        indexed = true;
+    }
+
+    ItemDisplayIndexMap::const_iterator itr = displayToEntry.find(displayId);
+    return itr != displayToEntry.end() ? itr->second : 0;
+}
+
+/**
+ * @brief Synthetic item entries for the item visual override system.
+ *
+ * TBC clients render player gear from the item entry in the PLAYER_VISIBLE_ITEM
+ * fields (unlike creatures, whose UNIT_VIRTUAL_ITEM_SLOT_DISPLAY carries a raw
+ * display id), so even a raw display id must be delivered to players as an item
+ * entry. For display ids that no real item uses - for example the equipmodel
+ * values of creature_equip_template_raw - a synthetic entry is derived from the
+ * display id itself. The entry only depends on the display id, so the item WDB
+ * caches of the clients stay valid across server restarts.
+ */
+#define ITEM_VISUAL_FAKE_ENTRY_BASE 3000000000u
+
+namespace
+{
+    std::mutex g_itemVisualFakeLock;                          // item queries (network thread) + morphs (world thread)
+    std::map<uint32, ItemPrototype*> g_itemVisualFakeProtos;  // synthetic entry -> prototype (never freed)
+}
+
+/**
+ * @brief Checks whether an entry is a synthetic item visual override entry.
+ *
+ * @param entry The item entry to check.
+ * @return True for entries of the synthetic range (base + display id).
+ */
+bool ObjectMgr::IsItemVisualFakeEntry(uint32 entry)
+{
+    return entry >= ITEM_VISUAL_FAKE_ENTRY_BASE;
+}
+
+/**
+ * @brief Gets the synthetic prototype registered for a fake entry.
+ *
+ * @param fakeEntry A synthetic entry (check IsItemVisualFakeEntry first).
+ * @return The prototype, or null when it was never created.
+ */
+ItemPrototype const* ObjectMgr::GetItemVisualFakePrototype(uint32 fakeEntry)
+{
+    std::lock_guard<std::mutex> guard(g_itemVisualFakeLock);
+    std::map<uint32, ItemPrototype*>::const_iterator itr = g_itemVisualFakeProtos.find(fakeEntry);
+    return itr != g_itemVisualFakeProtos.end() ? itr->second : NULL;
+}
+
+/**
+ * @brief Gets (or creates) the synthetic item shown for a raw display id.
+ *
+ * The prototype is a copy of the item currently equipped in the overridden
+ * slot: InventoryType, Sheath, Class, SubClass and Material match the real
+ * item, so attachment, sheathing and sounds stay correct, and tooltips keep
+ * showing the real item's name. Only the entry and the display id change.
+ * Clients receive it through the normal CMSG_ITEM_QUERY_SINGLE and
+ * CMSG_ITEM_NAME_QUERY answers.
+ *
+ * @param displayId The wanted ItemDisplayInfo.dbc id; raw ids such as the
+ *                  equipmodel values of creature_equip_template_raw work.
+ * @param baseProto The prototype of the item currently in the overridden slot.
+ * @return The synthetic prototype, or null for an invalid id.
+ */
+ItemPrototype const* ObjectMgr::GetOrCreateItemVisualFakePrototype(uint32 displayId, ItemPrototype const* baseProto)
+{
+    if (!baseProto || !displayId || displayId > 0xFFFFFFFFu - ITEM_VISUAL_FAKE_ENTRY_BASE)
+    {
+        return NULL;
+    }
+
+    uint32 fakeEntry = ITEM_VISUAL_FAKE_ENTRY_BASE + displayId;
+
+    std::lock_guard<std::mutex> guard(g_itemVisualFakeLock);
+    std::map<uint32, ItemPrototype*>::iterator itr = g_itemVisualFakeProtos.find(fakeEntry);
+    if (itr != g_itemVisualFakeProtos.end())
+    {
+        return itr->second;
+    }
+
+    ItemPrototype* proto = new ItemPrototype;
+    *proto = *baseProto;             // shallow copy: name and description keep pointing into the item storage strings
+    proto->ItemId = fakeEntry;
+    proto->DisplayInfoID = displayId;
+
+    g_itemVisualFakeProtos[fakeEntry] = proto;
+    return proto;
+}
 
 
 

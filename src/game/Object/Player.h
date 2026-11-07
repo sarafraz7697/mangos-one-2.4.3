@@ -1858,6 +1858,24 @@ class Player : public Unit
         VendorItemData m_virtualVendorItems;
         std::map<uint32, uint32> m_virtualVendorPrices;    // item -> price in copper (per BuyCount bundle)
 
+        // ITEM_VISUAL_PATCH: temporary equipped item display overrides (like transmogrification).
+        // The override is session only: it is never saved and disappears on logout/login.
+        // An override stores an item ENTRY because the client renders player gear from the
+        // item entry in the visible item fields: the entry of the wanted item, of an item
+        // that uses the wanted display, or a synthetic entry for a display no item uses.
+        bool SetItemVisualOverride(uint8 slot, uint32 displayId);                   // display id or item entry, 0 = restore the real look
+        bool SetItemVisualOverrideByItemEntry(uint32 itemEntry, uint32 displayId);  // display id or item entry, first equipment slot with this item
+        void ResetItemVisualOverrides();                                            // restore every slot
+
+        // The override item entry of a visible slot, 0 when the slot is not overridden.
+        // May be a synthetic display-only entry (>= 3000000000, see ObjectMgr).
+        uint32 GetItemVisualOverrideEntry(uint8 slot) const
+        {
+            return slot < EQUIPMENT_SLOT_END ? m_itemVisualOverrideEntries[slot] : 0;
+        }
+
+        uint32 m_itemVisualOverrideEntries[EQUIPMENT_SLOT_END];    // fake item entry per equipment slot, 0 = not overridden
+
         // Buy an item from a vendor
         bool BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, uint8 bag, uint8 slot);
 

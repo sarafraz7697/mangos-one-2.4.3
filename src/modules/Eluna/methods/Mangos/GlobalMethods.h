@@ -678,6 +678,7 @@ namespace LuaGlobalFunctions
      *     // UNUSED                               =     41,       // (event, player)
      *     PLAYER_EVENT_ON_COMMAND                 =     42,       // (event, player, command) - player is nil if command used from console. Can return false
      *     PLAYER_EVENT_ON_BUY_ITEM                =     55,       // (event, player, vendor, itemEntry, count) - vendor is nil for the fake inventory. Return false or a BuyResult number (0, 1, 2, 4, 5, 7, 8, 11, 12) to refuse the purchase
+     *     PLAYER_EVENT_ON_ITEM_MORPH              =     56,       // (event, player, slot, itemEntry, displayIdOrItemId) - return false to deny the item visual change
      * };
      * </pre>
      *

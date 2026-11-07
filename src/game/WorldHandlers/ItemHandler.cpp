@@ -378,135 +378,14 @@ void WorldSession::HandleItemQuerySingleOpcode(WorldPacket& recv_data)
     DETAIL_LOG("STORAGE: Item Query = %u", item);
 
     ItemPrototype const* pProto = ObjectMgr::GetItemPrototype(item);
+    if (!pProto && ObjectMgr::IsItemVisualFakeEntry(item))          // [item visual override]
+    {
+        pProto = ObjectMgr::GetItemVisualFakePrototype(item);       // synthetic item for a raw display id
+    }
+
     if (pProto)
     {
-        int loc_idx = GetSessionDbLocaleIndex();
-
-        std::string name = pProto->Name1;
-        std::string description = pProto->Description;
-        sObjectMgr.GetItemLocaleStrings(pProto->ItemId, loc_idx, &name, &description);
-
-
-        // guess size
-        WorldPacket data(SMSG_ITEM_QUERY_SINGLE_RESPONSE, 600);
-        data << pProto->ItemId;
-        data << pProto->Class;
-        data << pProto->SubClass;
-        data << uint32(-1);                                 // new 2.0.3, not exist in wdb cache?
-        data << name;
-        data << uint8(0x00);                                // pProto->Name2; // blizz not send name there, just uint8(0x00); <-- \0 = empty string = empty name...
-        data << uint8(0x00);                                // pProto->Name3; // blizz not send name there, just uint8(0x00);
-        data << uint8(0x00);                                // pProto->Name4; // blizz not send name there, just uint8(0x00);
-        data << pProto->DisplayInfoID;
-        data << pProto->Quality;
-        data << pProto->Flags;
-        data << pProto->BuyPrice;
-        data << pProto->SellPrice;
-        data << pProto->InventoryType;
-        data << pProto->AllowableClass;
-        data << pProto->AllowableRace;
-        data << pProto->ItemLevel;
-        data << pProto->RequiredLevel;
-        data << pProto->RequiredSkill;
-        data << pProto->RequiredSkillRank;
-        data << pProto->RequiredSpell;
-        data << pProto->RequiredHonorRank;
-        data << pProto->RequiredCityRank;
-        data << pProto->RequiredReputationFaction;
-        data << pProto->RequiredReputationRank;
-        data << pProto->MaxCount;
-        data << pProto->Stackable;
-        data << pProto->ContainerSlots;
-        for (int i = 0; i < MAX_ITEM_PROTO_STATS; ++i)
-        {
-            data << pProto->ItemStat[i].ItemStatType;
-            data << pProto->ItemStat[i].ItemStatValue;
-        }
-        for (int i = 0; i < MAX_ITEM_PROTO_DAMAGES; ++i)
-        {
-            data << pProto->Damage[i].DamageMin;
-            data << pProto->Damage[i].DamageMax;
-            data << pProto->Damage[i].DamageType;
-        }
-
-        // resistances (7)
-        data << pProto->Armor;
-        data << pProto->HolyRes;
-        data << pProto->FireRes;
-        data << pProto->NatureRes;
-        data << pProto->FrostRes;
-        data << pProto->ShadowRes;
-        data << pProto->ArcaneRes;
-
-        data << pProto->Delay;
-        data << pProto->AmmoType;
-        data << (float)pProto->RangedModRange;
-
-        for (int s = 0; s < MAX_ITEM_PROTO_SPELLS; ++s)
-        {
-            // send DBC data for cooldowns in same way as it used in Spell::SendSpellCooldown
-            // use `item_template` or if not set then only use spell cooldowns
-            SpellEntry const* spell = sSpellStore.LookupEntry(pProto->Spells[s].SpellId);
-            if (spell)
-            {
-                bool db_data = pProto->Spells[s].SpellCooldown >= 0 || pProto->Spells[s].SpellCategoryCooldown >= 0;
-
-                data << pProto->Spells[s].SpellId;
-                data << pProto->Spells[s].SpellTrigger;
-                data << uint32(-abs(pProto->Spells[s].SpellCharges));
-
-                if (db_data)
-                {
-                    data << uint32(pProto->Spells[s].SpellCooldown);
-                    data << uint32(pProto->Spells[s].SpellCategory);
-                    data << uint32(pProto->Spells[s].SpellCategoryCooldown);
-                }
-                else
-                {
-                    data << uint32(spell->RecoveryTime);
-                    data << uint32(spell->Category);
-                    data << uint32(spell->CategoryRecoveryTime);
-                }
-            }
-            else
-            {
-                data << uint32(0);
-                data << uint32(0);
-                data << uint32(0);
-                data << uint32(-1);
-                data << uint32(0);
-                data << uint32(-1);
-            }
-        }
-        data << pProto->Bonding;
-        data << description;
-        data << pProto->PageText;
-        data << pProto->LanguageID;
-        data << pProto->PageMaterial;
-        data << pProto->StartQuest;
-        data << pProto->LockID;
-        data << pProto->Material;
-        data << pProto->Sheath;
-        data << pProto->RandomProperty;
-        data << pProto->RandomSuffix;
-        data << pProto->Block;
-        data << pProto->ItemSet;
-        data << pProto->MaxDurability;
-        data << pProto->Area;
-        data << pProto->Map;                                // Added in 1.12.x & 2.0.1 client branch
-        data << pProto->BagFamily;
-        data << pProto->TotemCategory;
-        for (int s = 0; s < MAX_ITEM_PROTO_SOCKETS; ++s)
-        {
-            data << pProto->Socket[s].Color;
-            data << pProto->Socket[s].Content;
-        }
-        data << uint32(pProto->socketBonus);
-        data << uint32(pProto->GemProperties);
-        data << int32(pProto->RequiredDisenchantSkill);
-        data << float(pProto->ArmorDamageModifier);
-        data << uint32(pProto->Duration);                   // added in 2.4.2.8209, duration (seconds)
-        SendPacket(&data);
+        SendItemQuerySingleResponse(pProto);
     }
     else
     {
@@ -515,6 +394,145 @@ void WorldSession::HandleItemQuerySingleOpcode(WorldPacket& recv_data)
         data << uint32(item | 0x80000000);
         SendPacket(&data);
     }
+}
+
+/**
+ * @brief Sends the static item data of an item prototype to the client.
+ *
+ * Shared by the CMSG_ITEM_QUERY_SINGLE answer and by the item visual
+ * override system, which pushes its synthetic display-only items before the
+ * visible item update that references them is sent.
+ *
+ * @param pProto The item prototype to send.
+ */
+void WorldSession::SendItemQuerySingleResponse(ItemPrototype const* pProto)
+{
+    int loc_idx = GetSessionDbLocaleIndex();
+
+    std::string name = pProto->Name1;
+    std::string description = pProto->Description;
+    sObjectMgr.GetItemLocaleStrings(pProto->ItemId, loc_idx, &name, &description);
+
+    // guess size
+    WorldPacket data(SMSG_ITEM_QUERY_SINGLE_RESPONSE, 600);
+    data << pProto->ItemId;
+    data << pProto->Class;
+    data << pProto->SubClass;
+    data << uint32(-1);                                 // new 2.0.3, not exist in wdb cache?
+    data << name;
+    data << uint8(0x00);                                // pProto->Name2; // blizz not send name there, just uint8(0x00); <-- \0 = empty string = empty name...
+    data << uint8(0x00);                                // pProto->Name3; // blizz not send name there, just uint8(0x00);
+    data << uint8(0x00);                                // pProto->Name4; // blizz not send name there, just uint8(0x00);
+    data << pProto->DisplayInfoID;
+    data << pProto->Quality;
+    data << pProto->Flags;
+    data << pProto->BuyPrice;
+    data << pProto->SellPrice;
+    data << pProto->InventoryType;
+    data << pProto->AllowableClass;
+    data << pProto->AllowableRace;
+    data << pProto->ItemLevel;
+    data << pProto->RequiredLevel;
+    data << pProto->RequiredSkill;
+    data << pProto->RequiredSkillRank;
+    data << pProto->RequiredSpell;
+    data << pProto->RequiredHonorRank;
+    data << pProto->RequiredCityRank;
+    data << pProto->RequiredReputationFaction;
+    data << pProto->RequiredReputationRank;
+    data << pProto->MaxCount;
+    data << pProto->Stackable;
+    data << pProto->ContainerSlots;
+    for (int i = 0; i < MAX_ITEM_PROTO_STATS; ++i)
+    {
+        data << pProto->ItemStat[i].ItemStatType;
+        data << pProto->ItemStat[i].ItemStatValue;
+    }
+    for (int i = 0; i < MAX_ITEM_PROTO_DAMAGES; ++i)
+    {
+        data << pProto->Damage[i].DamageMin;
+        data << pProto->Damage[i].DamageMax;
+        data << pProto->Damage[i].DamageType;
+    }
+
+    // resistances (7)
+    data << pProto->Armor;
+    data << pProto->HolyRes;
+    data << pProto->FireRes;
+    data << pProto->NatureRes;
+    data << pProto->FrostRes;
+    data << pProto->ShadowRes;
+    data << pProto->ArcaneRes;
+
+    data << pProto->Delay;
+    data << pProto->AmmoType;
+    data << (float)pProto->RangedModRange;
+
+    for (int s = 0; s < MAX_ITEM_PROTO_SPELLS; ++s)
+    {
+        // send DBC data for cooldowns in same way as it used in Spell::SendSpellCooldown
+        // use `item_template` or if not set then only use spell cooldowns
+        SpellEntry const* spell = sSpellStore.LookupEntry(pProto->Spells[s].SpellId);
+        if (spell)
+        {
+            bool db_data = pProto->Spells[s].SpellCooldown >= 0 || pProto->Spells[s].SpellCategoryCooldown >= 0;
+
+            data << pProto->Spells[s].SpellId;
+            data << pProto->Spells[s].SpellTrigger;
+            data << uint32(-abs(pProto->Spells[s].SpellCharges));
+
+            if (db_data)
+            {
+                data << uint32(pProto->Spells[s].SpellCooldown);
+                data << uint32(pProto->Spells[s].SpellCategory);
+                data << uint32(pProto->Spells[s].SpellCategoryCooldown);
+            }
+            else
+            {
+                data << uint32(spell->RecoveryTime);
+                data << uint32(spell->Category);
+                data << uint32(spell->CategoryRecoveryTime);
+            }
+        }
+        else
+        {
+            data << uint32(0);
+            data << uint32(0);
+            data << uint32(0);
+            data << uint32(-1);
+            data << uint32(0);
+            data << uint32(-1);
+        }
+    }
+    data << pProto->Bonding;
+    data << description;
+    data << pProto->PageText;
+    data << pProto->LanguageID;
+    data << pProto->PageMaterial;
+    data << pProto->StartQuest;
+    data << pProto->LockID;
+    data << pProto->Material;
+    data << pProto->Sheath;
+    data << pProto->RandomProperty;
+    data << pProto->RandomSuffix;
+    data << pProto->Block;
+    data << pProto->ItemSet;
+    data << pProto->MaxDurability;
+    data << pProto->Area;
+    data << pProto->Map;                                // Added in 1.12.x & 2.0.1 client branch
+    data << pProto->BagFamily;
+    data << pProto->TotemCategory;
+    for (int s = 0; s < MAX_ITEM_PROTO_SOCKETS; ++s)
+    {
+        data << pProto->Socket[s].Color;
+        data << pProto->Socket[s].Content;
+    }
+    data << uint32(pProto->socketBonus);
+    data << uint32(pProto->GemProperties);
+    data << int32(pProto->RequiredDisenchantSkill);
+    data << float(pProto->ArmorDamageModifier);
+    data << uint32(pProto->Duration);                   // added in 2.4.2.8209, duration (seconds)
+    SendPacket(&data);
 }
 
 /**
@@ -646,7 +664,12 @@ void WorldSession::HandleItemNameQueryOpcode(WorldPacket& recv_data)
     recv_data.read_skip<uint64>();                          // guid
 
     DEBUG_LOG("WORLD: CMSG_ITEM_NAME_QUERY %u", itemid);
-    if (ItemPrototype const *pProto = ObjectMgr::GetItemPrototype(itemid))
+    ItemPrototype const* pProto = ObjectMgr::GetItemPrototype(itemid);
+    if (!pProto && ObjectMgr::IsItemVisualFakeEntry(itemid))        // [item visual override]
+    {
+        pProto = ObjectMgr::GetItemVisualFakePrototype(itemid);     // synthetic item for a raw display id
+    }
+    if (pProto)
     {
         int loc_idx = GetSessionDbLocaleIndex();
 

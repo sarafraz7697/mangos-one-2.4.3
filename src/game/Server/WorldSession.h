@@ -479,6 +479,9 @@ class WorldSession
         void SendEnchantmentLog(ObjectGuid targetGuid, ObjectGuid casterGuid, uint32 itemId, uint32 spellId);
         void SendItemEnchantTimeUpdate(ObjectGuid playerGuid, ObjectGuid itemGuid, uint32 slot, uint32 duration);
 
+        // Item queries
+        void SendItemQuerySingleResponse(ItemPrototype const* pProto);    // static item data; also pushes the synthetic items of the item visual override system
+
         // Taxi
         void SendTaxiStatus(ObjectGuid guid);
         void SendTaxiMenu(Creature* unit);

@@ -684,6 +684,10 @@ class ObjectMgr
         static CreatureDataAddon const* GetCreatureAddon(uint32 lowguid);           ///< Wrapper for sCreatureDataAddonStorage.LookupEntry
         static CreatureDataAddon const* GetCreatureTemplateAddon(uint32 entry);     ///< Wrapper for sCreatureInfoAddonStorage.LookupEntry
         static ItemPrototype const* GetItemPrototype(uint32 id);                    ///< Wrapper for sItemStorage.LookupEntry
+        static uint32 GetFirstItemEntryForDisplay(uint32 displayId);                ///< Lowest item entry using the display id, 0 if none
+        static bool IsItemVisualFakeEntry(uint32 entry);                            ///< True for synthetic entries of the item visual override system
+        static ItemPrototype const* GetItemVisualFakePrototype(uint32 fakeEntry);   ///< Synthetic prototype of a fake entry, 0 when unknown
+        static ItemPrototype const* GetOrCreateItemVisualFakePrototype(uint32 displayId, ItemPrototype const* baseProto); ///< Synthetic item shown for a display id no real item uses
         static InstanceTemplate const* GetInstanceTemplate(uint32 map);             ///< Wrapper for sInstanceTemplate.LookupEntry
 
         void LoadArenaTeams();
