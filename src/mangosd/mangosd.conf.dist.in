@@ -1074,6 +1074,23 @@ LivingWorld.AnchorPolicyMask              = 0
 ################################################################################
 # CREATURE AND GAMEOBJECT SETTINGS
 #
+#    Rate.CritChance.Multiplier
+#        Multiplier applied to the final critical strike chance of every melee, ranged
+#        and spell attack of players and creatures (base crit, gear, talents and buffs
+#        are all multiplied). The result is capped at 100% and the same value is shown
+#        in the character sheet, so the panel always matches the real rolls.
+#        Default: 10    - (9% crit from gear => 90% crit chance)
+#                 1.0   - off (original chances)
+#
+#    Creature.DisplayHealthAsPercent
+#        Creatures send their health and mana to clients as percentage (0-100) instead
+#        of real values, so target frames and nameplates show percent bars. Players,
+#        pets, totems and charmed units always send real values.
+#        NOTE: applies to creatures as they are (re)spawned into client view; restart
+#        the server after changing this value.
+#        Default: 1   - enabled
+#                 0   - disabled
+#
 #    ThreatRadius
 #        Radius for creature to evade after being pulled away from combat start point
 #        If ThreatRadius is less than creature aggro radius then aggro radius will be used
@@ -1175,6 +1192,8 @@ LivingWorld.AnchorPolicyMask              = 0
 ################################################################################
 
 ThreatRadius                              = 100
+Rate.CritChance.Multiplier                = 10.0
+Creature.DisplayHealthAsPercent           = 1
 Rate.Creature.Aggro                       = 1
 CreatureRespawnAggroDelay                 = 5000
 CreatureFamilyFleeAssistanceRadius        = 30

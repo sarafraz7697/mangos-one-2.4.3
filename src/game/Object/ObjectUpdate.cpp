@@ -488,6 +488,27 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
         }
     }
 
+    // [config] Creatures send health/mana as percentage (0-100) instead of real values,
+    // so target frames and nameplates show percent bars. Players and player-controlled
+    // units (pets, totems, charmed units) always send real values. The health/maxhealth
+    // (power) fields are always packed together so the client never mixes real and
+    // percent data.
+    bool creaturePercentStats = false;
+    if (sWorld.getConfig(CONFIG_BOOL_CREATURE_HEALTH_AS_PERCENT) && GetTypeId() == TYPEID_UNIT)
+    {
+        Creature const* creature = (Creature const*)this;
+        creaturePercentStats = !creature->IsPet() && !creature->IsTotem() &&
+                               !((Unit const*)this)->GetCharmerOrOwnerGuid().IsPlayer();
+    }
+
+    if (creaturePercentStats)
+    {
+        updateMask->SetBit(UNIT_FIELD_HEALTH);
+        updateMask->SetBit(UNIT_FIELD_MAXHEALTH);
+        updateMask->SetBit(UNIT_FIELD_POWER1);
+        updateMask->SetBit(UNIT_FIELD_MAXPOWER1);
+    }
+
     MANGOS_ASSERT(updateMask && updateMask->GetCount() == m_valuesCount);
 
     *data << (uint8)updateMask->GetBlockCount();
@@ -543,6 +564,37 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
                         {
                             *data << (m_uint32Values[index] & ~(1 << (AURA_STATE_CONFLAGRATE - 1)));
                         }
+                    }
+                    else
+                    {
+                        *data << m_uint32Values[index];
+                    }
+                }
+                // [config] creature health/mana as percentage (see creaturePercentStats above)
+                else if (creaturePercentStats &&
+                         (index == UNIT_FIELD_HEALTH || index == UNIT_FIELD_MAXHEALTH ||
+                          index == UNIT_FIELD_POWER1 || index == UNIT_FIELD_MAXPOWER1))
+                {
+                    bool   isMaxField = (index == UNIT_FIELD_MAXHEALTH || index == UNIT_FIELD_MAXPOWER1);
+                    uint32 curField   = (index == UNIT_FIELD_HEALTH || index == UNIT_FIELD_MAXHEALTH) ? UNIT_FIELD_HEALTH : UNIT_FIELD_POWER1;
+                    uint32 maxField   = (curField == UNIT_FIELD_HEALTH) ? UNIT_FIELD_MAXHEALTH : UNIT_FIELD_MAXPOWER1;
+
+                    uint32 cur = m_uint32Values[curField];
+                    uint32 max = m_uint32Values[maxField];
+
+                    if (max > 0)
+                    {
+                        // rounded percentage, at least 1% while any amount remains
+                        uint32 pct = uint32((uint64(cur) * 100 + max - 1) / max);
+                        if (pct > 100)
+                        {
+                            pct = 100;
+                        }
+                        if (cur > 0 && pct == 0)
+                        {
+                            pct = 1;
+                        }
+                        *data << uint32(isMaxField ? 100 : pct);
                     }
                     else
                     {

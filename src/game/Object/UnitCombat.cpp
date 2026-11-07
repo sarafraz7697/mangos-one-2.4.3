@@ -219,6 +219,29 @@ MeleeHitOutcome Unit::RollMeleeOutcomeAgainst(const Unit* pVictim, WeaponAttackT
     int32 skillBonus  = 4 * (attackerWeaponSkill - victimMaxSkillValueForLevel);
     int32 sum = 0;
     int32 roll = urand(0, 10000);
+
+    // [crit multiplier mod] The combined miss/dodge/parry/block window may not exceed
+    // the space the critical chance leaves on the one-roll attack table, so the real
+    // crit rate always equals the value shown in the character sheet. This must run
+    // before the outcome checks below start consuming the chances.
+    {
+        int32 avoid_cap = 10000 - crit_chance;
+        if (avoid_cap < 0)
+        {
+            avoid_cap = 0;
+        }
+
+        int32 avoid_total = miss_chance + dodge_chance + parry_chance + block_chance;
+        if (avoid_total > avoid_cap)
+        {
+            float avoid_scale = float(avoid_cap) / float(avoid_total);
+            miss_chance  = int32(miss_chance  * avoid_scale);
+            dodge_chance = int32(dodge_chance * avoid_scale);
+            parry_chance = int32(parry_chance * avoid_scale);
+            block_chance = int32(block_chance * avoid_scale);
+        }
+    }
+
     int32 tmp = miss_chance;
 
     DEBUG_FILTER_LOG(LOG_FILTER_COMBAT, "RollMeleeOutcomeAgainst: skill bonus of %d for attacker", skillBonus);
@@ -305,7 +328,10 @@ MeleeHitOutcome Unit::RollMeleeOutcomeAgainst(const Unit* pVictim, WeaponAttackT
 
         tmp = (10 + (victimDefenseSkill - skill)) * 100;
         tmp = tmp > 2500 ? 2500 : tmp;
-        if (roll < (sum += tmp))
+        // [crit multiplier mod] Glancing blows are removed from the attack table; they
+        // would otherwise push crits off the table when attacking higher level targets.
+        tmp = 0;
+        if (tmp > 0 && roll < (sum += tmp))
         {
             DEBUG_FILTER_LOG(LOG_FILTER_COMBAT, "RollMeleeOutcomeAgainst: GLANCING <%d, %d)", sum - 2500, sum);
             return MELEE_HIT_GLANCING;
@@ -1160,6 +1186,9 @@ float Unit::GetUnitCriticalChance(WeaponAttackType attackType, const Unit* pVict
     {
         crit = 5.0f;
         crit += GetTotalAuraModifier(SPELL_AURA_MOD_CRIT_PERCENT);
+
+        // [crit multiplier mod] creatures use the configured multiplier on their crit
+        crit *= sWorld.getConfig(CONFIG_FLOAT_RATE_CRIT_CHANCE_MULTIPLIER);
     }
 
     // flat aura mods
@@ -1193,6 +1222,14 @@ float Unit::GetUnitCriticalChance(WeaponAttackType attackType, const Unit* pVict
     if (crit < 0.0f)
     {
         crit = 0.0f;
+    }
+
+    // [crit multiplier mod] keep the final chance within the attack table range.
+    // Player chances come from the (already multiplied) character sheet fields,
+    // creature chances are multiplied above - no further scaling happens here.
+    if (crit > 100.0f)
+    {
+        crit = 100.0f;
     }
     return crit;
 }

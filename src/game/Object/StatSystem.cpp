@@ -29,6 +29,7 @@
 #include "Creature.h"
 #include "SharedDefines.h"
 #include "SpellAuras.h"
+#include "World.h"
 #include <cmath>
 
 /*#######################################
@@ -585,6 +586,16 @@ void Player::UpdateCritPercentage(WeaponAttackType attType)
     // Modify crit from weapon skill and maximized defense skill of same level victim difference
     value += (int32(GetWeaponSkillValue(attType)) - int32(GetMaxSkillValueForLevel())) * 0.04f;
     value = value < 0.0f ? 0.0f : value;
+
+    // [crit multiplier mod] Scale the final chance (base crit, gear, talents and buffs are
+    // all multiplied) and cap at 100%. The character sheet reads this field, so the panel
+    // always shows the same chance the combat rolls actually use.
+    value *= sWorld.getConfig(CONFIG_FLOAT_RATE_CRIT_CHANCE_MULTIPLIER);
+    if (value > 100.0f)
+    {
+        value = 100.0f;
+    }
+
     SetStatFloatValue(index, value);
 }
 
@@ -666,6 +677,14 @@ void Player::UpdateSpellCritChance(uint32 school)
     crit += GetTotalAuraModifierByMiscMask(SPELL_AURA_MOD_SPELL_CRIT_CHANCE_SCHOOL, 1 << school);
     // Increase crit from spell crit ratings
     crit += GetRatingBonusValue(CR_CRIT_SPELL);
+
+    // [crit multiplier mod] Scale the final chance and cap at 100%. The character sheet
+    // reads this field, so the panel always shows the chance the combat rolls actually use.
+    crit *= sWorld.getConfig(CONFIG_FLOAT_RATE_CRIT_CHANCE_MULTIPLIER);
+    if (crit > 100.0f)
+    {
+        crit = 100.0f;
+    }
 
     // Store crit value
     SetFloatValue(PLAYER_SPELL_CRIT_PERCENTAGE1 + school, crit);

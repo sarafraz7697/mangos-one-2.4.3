@@ -459,6 +459,10 @@ bool Unit::IsSpellCrit(Unit* pVictim, SpellEntry const* spellProto, SpellSchoolM
             {
                 crit_chance = float(m_baseSpellCritChance);
                 crit_chance += GetTotalAuraModifierByMiscMask(SPELL_AURA_MOD_SPELL_CRIT_CHANCE_SCHOOL, schoolMask);
+
+                // [crit multiplier mod] creatures use the configured multiplier on their
+                // spell crit (players use the already multiplied character sheet fields)
+                crit_chance *= sWorld.getConfig(CONFIG_FLOAT_RATE_CRIT_CHANCE_MULTIPLIER);
             }
             // taken
             if (pVictim)
@@ -521,6 +525,13 @@ bool Unit::IsSpellCrit(Unit* pVictim, SpellEntry const* spellProto, SpellSchoolM
     }
 
     crit_chance = crit_chance > 0.0f ? crit_chance : 0.0f;
+
+    // [crit multiplier mod] cap the final chance at 100%
+    if (crit_chance > 100.0f)
+    {
+        crit_chance = 100.0f;
+    }
+
     if (roll_chance_f(crit_chance))
     {
         return true;

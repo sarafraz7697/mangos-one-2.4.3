@@ -649,6 +649,9 @@ void World::LoadConfigSettings(bool reload)
 
     setConfig(CONFIG_BOOL_ENABLE_QUEST_TRACKER,        "QuestTracker.Enable", 0);
 
+    setConfigMinMax(CONFIG_FLOAT_RATE_CRIT_CHANCE_MULTIPLIER, "Rate.CritChance.Multiplier", 10.0f, 0.0f, 100.0f);
+    setConfig(CONFIG_BOOL_CREATURE_HEALTH_AS_PERCENT, "Creature.DisplayHealthAsPercent", true);
+
 #ifdef ENABLE_PLAYERBOTS
     setConfig(CONFIG_BOOL_PLAYERBOT_DISABLE, "PlayerbotAI.DisableBots", true);
     setConfig(CONFIG_BOOL_PLAYERBOT_DEBUGWHISPER, "PlayerbotAI.DebugWhisper", false);
