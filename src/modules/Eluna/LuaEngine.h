@@ -431,6 +431,7 @@ public:
     void OnSkillChange(Player* pPlayer, uint32 skillId, uint32 skillValue);
     void OnLearnSpell(Player* pPlayer, uint32 spellid);
     InventoryResult OnCanUseItem(const Player* pPlayer, uint32 itemEntry);
+    int32 OnBuyItem(Player* pPlayer, Creature* pVendor, uint32 itemEntry, uint32 count);
     void OnLuaStateClose();
     void OnLuaStateOpen();
     bool OnAddonMessage(Player* sender, uint32 type, std::string& msg, Player* receiver, Guild* guild, Group* group, Channel* channel);

@@ -186,6 +186,56 @@ InventoryResult Eluna::OnCanUseItem(const Player* pPlayer, uint32 itemEntry)
     CleanUpStack(2);
     return result;
 }
+
+// Lets a Lua handler refuse a vendor purchase.
+// Returns -1 when the purchase may go on, otherwise the BuyResult code for the client.
+// A handler refuses by returning false (BUY_ERR_CANT_FIND_ITEM) or a BuyResult number.
+// pVendor is NULL (nil in Lua) for the player's fake inventory.
+int32 Eluna::OnBuyItem(Player* pPlayer, Creature* pVendor, uint32 itemEntry, uint32 count)
+{
+    START_HOOK_WITH_RETVAL(PLAYER_EVENT_ON_BUY_ITEM, -1);
+    int32 result = -1;
+    HookPush(pPlayer);
+    HookPush(pVendor);
+    HookPush(itemEntry);
+    HookPush(count);
+    int n = SetupStack(binding, key, 4);
+
+    while (n > 0)
+    {
+        int r = CallOneFunction(n--, 4, 1);
+
+        // the first handler that refuses decides, the others are still called
+        if (result < 0)
+        {
+            if (lua_isboolean(L, r))
+            {
+                if (!lua_toboolean(L, r))
+                    result = 0;                                 // BUY_ERR_CANT_FIND_ITEM
+            }
+            else if (lua_isnumber(L, r))
+            {
+                switch (CHECKVAL<int32>(r))
+                {
+                    case 1:  result = 1;  break;                // BUY_ERR_ITEM_ALREADY_SOLD
+                    case 2:  result = 2;  break;                // BUY_ERR_NOT_ENOUGHT_MONEY
+                    case 4:  result = 4;  break;                // BUY_ERR_SELLER_DONT_LIKE_YOU
+                    case 5:  result = 5;  break;                // BUY_ERR_DISTANCE_TOO_FAR
+                    case 7:  result = 7;  break;                // BUY_ERR_ITEM_SOLD_OUT
+                    case 8:  result = 8;  break;                // BUY_ERR_CANT_CARRY_MORE
+                    case 11: result = 11; break;                // BUY_ERR_RANK_REQUIRE
+                    case 12: result = 12; break;                // BUY_ERR_REPUTATION_REQUIRE
+                    default: result = 0;  break;                // BUY_ERR_CANT_FIND_ITEM
+                }
+            }
+        }
+
+        lua_pop(L, 1);
+    }
+
+    CleanUpStack(4);
+    return result;
+}
 void Eluna::OnPlayerEnterCombat(Player* pPlayer, Unit* pEnemy)
 {
     START_HOOK(PLAYER_EVENT_ON_ENTER_COMBAT);

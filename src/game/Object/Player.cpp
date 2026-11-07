@@ -4596,6 +4596,19 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
         return false;
     }
 
+    // Used by Eluna: a Lua handler of PLAYER_EVENT_ON_BUY_ITEM can refuse the purchase
+#ifdef ENABLE_ELUNA
+    if (Eluna* e = GetEluna())
+    {
+        int32 buyResult = e->OnBuyItem(this, pCreature, item, count);
+        if (buyResult >= 0)
+        {
+            SendBuyError(static_cast<BuyResult>(buyResult), pCreature, item, 0);
+            return false;
+        }
+    }
+#endif /* ENABLE_ELUNA */
+
     uint32 totalCount = pProto->BuyCount * count;
 
     // check current item amount if it limited
