@@ -248,6 +248,19 @@ bool Eluna::OnItemMorph(Player* pPlayer, uint8 slot, uint32 itemEntry, uint32 di
     HookPush(displayId);
     return CallAllFunctionsBool(binding, key, true);
 }
+
+// Notifies Lua that a vendor purchase fully succeeded (item stored, money taken).
+// The bought item is handed over so scripts can attach things to it (rental time).
+// pVendor is NULL (nil in Lua) for the player's fake inventory.
+void Eluna::OnBuyItemComplete(Player* pPlayer, Creature* pVendor, Item* pItem, uint32 count)
+{
+    START_HOOK(PLAYER_EVENT_ON_BUY_ITEM_COMPLETE);
+    HookPush(pPlayer);
+    HookPush(pVendor);
+    HookPush(pItem);
+    HookPush(count);
+    CallAllFunctions(binding, key);
+}
 void Eluna::OnPlayerEnterCombat(Player* pPlayer, Unit* pEnemy)
 {
     START_HOOK(PLAYER_EVENT_ON_ENTER_COMBAT);

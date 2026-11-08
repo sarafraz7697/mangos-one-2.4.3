@@ -364,7 +364,8 @@ void LootStore::ReportNotExistedId(uint32 id) const
 
 // Checks if the entry (quest, non-quest, reference) takes it's chance (at loot generation)
 // RATE_DROP_ITEMS is no longer used for all types of entries
-bool LootStoreItem::Roll(bool rate) const
+// VIP_PATCH: chanceBonus (from the loot owner's VIP level) scales the chance too.
+bool LootStoreItem::Roll(bool rate, float chanceBonus) const
 {
     if (chance >= 100.0f)
     {
@@ -373,14 +374,14 @@ bool LootStoreItem::Roll(bool rate) const
 
     if (mincountOrRef < 0)                                  // reference case
     {
-        return roll_chance_f(chance * (rate ? sWorld.getConfig(CONFIG_FLOAT_RATE_DROP_ITEM_REFERENCED) : 1.0f));
+        return roll_chance_f(chance * chanceBonus * (rate ? sWorld.getConfig(CONFIG_FLOAT_RATE_DROP_ITEM_REFERENCED) : 1.0f));
     }
 
     ItemPrototype const* pProto = ObjectMgr::GetItemPrototype(itemid);
 
     float qualityModifier = pProto && rate ? sWorld.getConfig(qualityToRate[pProto->Quality]) : 1.0f;
 
-    return roll_chance_f(chance * qualityModifier);
+    return roll_chance_f(chance * chanceBonus * qualityModifier);
 }
 
 // Checks correctness of values
@@ -647,6 +648,17 @@ bool Loot::FillLoot(uint32 loot_id, LootStore const& store, Player* loot_owner, 
 
     items.reserve(MAX_NR_LOOT_ITEMS);
     m_questItems.reserve(MAX_NR_QUEST_ITEMS);
+
+    // VIP_PATCH: better drop chances for high VIP ranks, for the player the loot
+    // is generated from (grouped / equal-chance entries are not affected: their
+    // "chance" is a selection weight, not a drop chance). Always reset first,
+    // a Loot object can be cleared and refilled for another player.
+    chanceBonus = 1.0f;
+
+    if (uint8 vip = loot_owner->GetEffectiveVIPLevel())
+    {
+        chanceBonus = 1.0f + (vip * sWorld.getConfig(CONFIG_FLOAT_VIP_LOOT_CHANCE_PER_LEVEL)) / 100.0f;
+    }
 
     tab->Process(*this, store, store.IsRatesAllowed());     // Processing is done there, callback via Loot::AddItem()
 
@@ -1513,7 +1525,7 @@ void LootTemplate::Process(Loot& loot, LootStore const& store, bool rate, uint8 
     // Rolling non-grouped items
     for (LootStoreItemList::const_iterator i = Entries.begin() ; i != Entries.end() ; ++i)
     {
-        if (DisableMgr::IsDisabledFor(DISABLE_TYPE_ITEM_DROP, i->itemid) || !i->Roll(rate))
+        if (DisableMgr::IsDisabledFor(DISABLE_TYPE_ITEM_DROP, i->itemid) || !i->Roll(rate, loot.GetChanceBonus()))
         {
             continue;                                        // Bad luck for the entry
         }

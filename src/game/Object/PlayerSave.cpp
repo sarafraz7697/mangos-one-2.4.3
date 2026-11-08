@@ -312,9 +312,11 @@ void Player::SaveToDB()
 
     for (uint32 i = 0; i < EQUIPMENT_SLOT_END; ++i)         // string: item id, ench (perm/temp)
     {
-        // [item visual override] save the real equipped item, not the (possibly
-        // overridden) visible item field, so the login screen shows the real gear
-        ss << (m_items[i] ? m_items[i]->GetEntry() : 0) << " ";
+        // [item visual override] ITEM_VISUAL_PERSIST_PATCH: save the entry the
+        // slot SHOWS. A bought morph look (character_item_morph) replaces the
+        // real entry, so the character selection list displays the morphed
+        // gear like the world does; slots without a look keep the real item.
+        ss << GetShownItemEntryForSlot(i) << " ";
 
         uint32 ench1 = GetUInt32Value(PLAYER_VISIBLE_ITEM_1_0 + i * MAX_VISIBLE_ITEM_OFFSET + 1 + PERM_ENCHANTMENT_SLOT);
         uint32 ench2 = GetUInt32Value(PLAYER_VISIBLE_ITEM_1_0 + i * MAX_VISIBLE_ITEM_OFFSET + 1 + TEMP_ENCHANTMENT_SLOT);
@@ -351,6 +353,18 @@ void Player::SaveToDB()
     _SaveSkills();
     m_reputationMgr.SaveToDB();
     GetSession()->SaveTutorialsData();                      // changed only while character in game
+
+    // MAGIC_GOLD_PATCH: keep the Magic Gold balance with the character
+    {
+        static SqlStatementID delMagicGold;
+        static SqlStatementID insMagicGold;
+
+        SqlStatement delStmt = CharacterDatabase.CreateStatement(delMagicGold, "DELETE FROM `character_magic_gold` WHERE `guid` = ?");
+        delStmt.PExecute(GetGUIDLow());
+
+        SqlStatement insStmt = CharacterDatabase.CreateStatement(insMagicGold, "INSERT INTO `character_magic_gold` (`guid`, `mg`) VALUES (?, ?)");
+        insStmt.PExecute(GetGUIDLow(), m_magicGold);
+    }
 
     CharacterDatabase.CommitTransaction();
 

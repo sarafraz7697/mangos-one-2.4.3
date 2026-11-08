@@ -48,6 +48,7 @@
 #include "SocialMgr.h"
 #include "Chat.h"
 #include <cstring>
+#include <sstream>
 #include <string>
 
 Channel::Channel(const std::string& name, uint32 channel_id)
@@ -717,8 +718,35 @@ void Channel::Say(Player* player, const char* text, uint32 lang)
     {
         lang = LANG_UNIVERSAL;
     }
+
+    // VIP_PATCH: colored sender names in chat channels.
+    //
+    // A CHAT_MSG_CHANNEL packet carries the sender as a GUID only - the 2.4.3
+    // client resolves the name from its own player cache and paints it in the
+    // class color. A "|cff" markup in the packet is not possible, so the
+    // previous approach (passing the colored name to BuildChatPacket) never
+    // showed anything. Instead a sender with a VIP color gets the channel line
+    // composed as a system message:
+    //     [Channel] |cffRRGGBBName|r: text
+    // System messages render "|c" color codes, so every VIP level keeps its
+    // own color. Trade-off: the line is not linked to the sender GUID (no
+    // right-click whisper/ignore on it); players without a VIP color keep the
+    // normal channel packets. Ignored senders are still filtered out.
+    std::string senderName = player->GetVIPChatName();
+
+    if (senderName != player->GetName())
+    {
+        std::ostringstream colored;
+        colored << "[" << m_name << "] " << senderName << ": " << text;
+
+        WorldPacket data;
+        ChatHandler::BuildChatPacket(data, CHAT_MSG_SYSTEM, colored.str().c_str(), LANG_UNIVERSAL, CHAT_TAG_NONE, ObjectGuid());
+        SendToAll(&data, guid);
+        return;
+    }
+
     WorldPacket data;
-    ChatHandler::BuildChatPacket(data, CHAT_MSG_CHANNEL, text, Language(lang), player->GetChatTag(), guid, player->GetName(), ObjectGuid(), "", m_name.c_str());
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_CHANNEL, text, Language(lang), player->GetChatTag(), guid, senderName.c_str(), ObjectGuid(), "", m_name.c_str());
     SendToAll(&data, !m_players[guid].IsModerator() ? guid : ObjectGuid());
 }
 

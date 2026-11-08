@@ -34,10 +34,49 @@
 #include "World.h"
 #include "Database/DatabaseEnv.h"
 #include "DBCStores.h"
+#include "Chat.h"
+#include <ctime>
 #ifdef ENABLE_ELUNA
 #include "LuaEngine.h"
-#include <ctime>
 #endif /* ENABLE_ELUNA */
+
+/**
+ * @brief Resolves the universal morph input into the item entry shown to clients.
+ *
+ * Accepted inputs, resolved in this order:
+ *   1. an item entry - for example a creature_equip_template.equipentry1-3 value,
+ *   2. a display id that items use - an item_template.displayid value: the lowest
+ *      item with that display is shown,
+ *   3. any other display id - for example a creature_equip_template_raw
+ *      .equipmodel1-3 value: a synthetic display-only item is shown.
+ *
+ * @param displayId The raw input (display id or item entry).
+ * @param baseProto The real item prototype the look is applied to (stat donor
+ *                  for synthetic display-only items).
+ * @param fakeProtoOut Optional, receives the synthetic prototype when one is used.
+ * @return The item entry to place in the visible item fields, 0 when not showable.
+ */
+static uint32 ResolveItemVisualEntry(uint32 displayId, ItemPrototype const* baseProto, ItemPrototype const** fakeProtoOut = NULL)
+{
+    if (ItemPrototype const* inputProto = ObjectMgr::GetItemPrototype(displayId))
+    {
+        return inputProto->ItemId;                          // input is an item entry
+    }
+
+    if (uint32 itemEntry = ObjectMgr::GetFirstItemEntryForDisplay(displayId))
+    {
+        return itemEntry;                                   // input is a display id some item uses
+    }
+
+    ItemPrototype const* fakeProto = ObjectMgr::GetOrCreateItemVisualFakePrototype(displayId, baseProto);
+
+    if (fakeProto && fakeProtoOut)
+    {
+        *fakeProtoOut = fakeProto;
+    }
+
+    return fakeProto ? fakeProto->ItemId : 0;               // synthetic item for a raw display id
+}
 
 // Return stored item (if stored to stack, it can diff. from pItem). And pItem ca be deleted in this case.
 Item* Player::StoreNewItem(ItemPosCountVec const& dest, uint32 item, bool update, int32 randomPropertyId)
@@ -405,10 +444,43 @@ void Player::SetVisibleItemSlot(uint8 slot, Item* pItem)
         // Honored only while the system is enabled, so flipping ItemVisual.Enable off
         // restores the real look on the next equip/unequip of the slot.
         uint32 visibleEntry = pItem->GetEntry();
-        if (slot < EQUIPMENT_SLOT_END && m_itemVisualOverrideEntries[slot] &&
-                sWorld.getConfig(CONFIG_BOOL_ITEM_VISUAL_OVERRIDE_ENABLE))
+        bool overrideActive = slot < EQUIPMENT_SLOT_END && sWorld.getConfig(CONFIG_BOOL_ITEM_VISUAL_OVERRIDE_ENABLE);
+
+        if (overrideActive && m_itemVisualOverrideEntries[slot] &&
+                (!m_itemVisualOverrideSlotItems[slot] || m_itemVisualOverrideSlotItems[slot] == pItem->GetGUIDLow()))
         {
+            // [item visual override] send the overridden item entry instead of the real
+            // one, so re-equipping the same item keeps the changed look until logout.
+            // The override belongs to the item it was morphed on: another item swapped
+            // into the slot shows its own look again.
             visibleEntry = m_itemVisualOverrideEntries[slot];
+        }
+        else if (overrideActive)
+        {
+            // ITEM_VISUAL_PERSIST_PATCH: a saved look (bought with the VIP morph service)
+            // follows the item itself and survives relogging. Re-apply it whenever the
+            // item is equipped, so login and swap-in/swap-out both show the bought look.
+            std::map<uint32, ItemMorphRecord>::const_iterator morphItr = m_itemMorphRecords.find(pItem->GetGUIDLow());
+
+            if (morphItr != m_itemMorphRecords.end() &&
+                    (!morphItr->second.expireTime || morphItr->second.expireTime > time(NULL))) // skip already expired records
+            {
+                ItemPrototype const* fakeProto = NULL;
+                uint32 morphEntry = ResolveItemVisualEntry(morphItr->second.displayId, pItem->GetProto(), &fakeProto);
+
+                if (morphEntry)
+                {
+                    visibleEntry = morphEntry;
+                    m_itemVisualOverrideEntries[slot] = morphEntry;        // keep the session slot override in sync
+                    m_itemVisualOverrideSlotItems[slot] = pItem->GetGUIDLow();
+
+                    // make sure this client knows the (possibly synthetic) item model
+                    if (fakeProto && GetSession())
+                    {
+                        GetSession()->SendItemQuerySingleResponse(fakeProto);
+                    }
+                }
+            }
         }
 
         SetUInt32Value(VisibleBase + 0, visibleEntry);
@@ -442,9 +514,7 @@ void Player::SetVisibleItemSlot(uint8 slot, Item* pItem)
 /**
  * @brief Changes the displayed look of one equipped item, for everyone in range.
  *
- * The override is temporary: it lives only in this session (this Player object),
- * it is never written to the database and it disappears on logout/login. The
- * change is broadcast immediately through the PLAYER_VISIBLE_ITEM update
+ * The change is broadcast immediately through the PLAYER_VISIBLE_ITEM update
  * fields, the same mechanism .morph uses for creature models. Enchant glows,
  * the real item stats, tooltips and inspection keep working from the real item.
  *
@@ -453,9 +523,14 @@ void Player::SetVisibleItemSlot(uint8 slot, Item* pItem)
  *                  as the equipmodel values of creature_equip_template_raw work)
  *                  or an item entry (for example a creature_equip_template
  *                  .equipentry value). 0 restores the real look.
+ * @param expireSeconds ITEM_VISUAL_PERSIST_PATCH: when persist is set, seconds
+ *                      the bought look stays (0 = no expiry).
+ * @param persist ITEM_VISUAL_PERSIST_PATCH: save the look in the
+ *                character_item_morph table so it survives relogging and
+ *                follows the item (removed again with displayId 0).
  * @return true when the override was applied (or restored).
  */
-bool Player::SetItemVisualOverride(uint8 slot, uint32 displayId)
+bool Player::SetItemVisualOverride(uint8 slot, uint32 displayId, uint32 expireSeconds, bool persist)
 {
     if (slot >= EQUIPMENT_SLOT_END)
     {
@@ -469,6 +544,17 @@ bool Player::SetItemVisualOverride(uint8 slot, uint32 displayId)
     if (displayId == 0)
     {
         m_itemVisualOverrideEntries[slot] = 0;
+        m_itemVisualOverrideSlotItems[slot] = 0;
+
+        // ITEM_VISUAL_PERSIST_PATCH: restoring also forgets a saved look of this item
+        if (pItem)
+        {
+            if (m_itemMorphRecords.erase(pItem->GetGUIDLow()))
+            {
+                CharacterDatabase.PExecute("DELETE FROM `character_item_morph` WHERE `item_guid` = '%u'", pItem->GetGUIDLow());
+            }
+        }
+
         SetVisibleItemSlot(slot, pItem);
         return true;
     }
@@ -496,32 +582,8 @@ bool Player::SetItemVisualOverride(uint8 slot, uint32 displayId)
 
     // The client renders gear from the item entry, so the input must become an
     // item entry. Slot fitting is NOT validated on purpose (system method).
-    // Accepted inputs, resolved in this order:
-    //   1. an item entry - for example a creature_equip_template.equipentry1-3
-    //      value: show that item itself,
-    //   2. a display id that items use - an item_template.displayid value:
-    //      show the lowest item with that display,
-    //   3. any other display id - for example a creature_equip_template_raw
-    //      .equipmodel1-3 value: show a synthetic display-only item created on
-    //      the fly and delivered to clients through their item queries.
-    uint32 overrideEntry = 0;
     ItemPrototype const* fakeProto = NULL;
-    if (ItemPrototype const* inputProto = ObjectMgr::GetItemPrototype(displayId))
-    {
-        overrideEntry = inputProto->ItemId;              // input is an item entry
-    }
-    else if (uint32 itemEntry = ObjectMgr::GetFirstItemEntryForDisplay(displayId))
-    {
-        overrideEntry = itemEntry;                       // input is a display id some item uses
-    }
-    else
-    {
-        fakeProto = ObjectMgr::GetOrCreateItemVisualFakePrototype(displayId, pItem->GetProto());
-        if (fakeProto)
-        {
-            overrideEntry = fakeProto->ItemId;           // synthetic item for a raw display id
-        }
-    }
+    uint32 overrideEntry = ResolveItemVisualEntry(displayId, pItem->GetProto(), &fakeProto);
 
     if (!overrideEntry)
     {
@@ -538,7 +600,24 @@ bool Player::SetItemVisualOverride(uint8 slot, uint32 displayId)
     }
 
     m_itemVisualOverrideEntries[slot] = overrideEntry;
+    m_itemVisualOverrideSlotItems[slot] = pItem->GetGUIDLow();
     SetUInt32Value(PLAYER_VISIBLE_ITEM_1_0 + (slot * MAX_VISIBLE_ITEM_OFFSET), overrideEntry);
+
+    // ITEM_VISUAL_PERSIST_PATCH: remember bought looks per item guid, with optional expiry
+    if (persist)
+    {
+        ItemMorphRecord record;
+        record.displayId = displayId;
+        record.expireTime = expireSeconds ? time(NULL) + expireSeconds : 0;
+        m_itemMorphRecords[pItem->GetGUIDLow()] = record;
+
+        CharacterDatabase.BeginTransaction();
+        CharacterDatabase.PExecute("DELETE FROM `character_item_morph` WHERE `item_guid` = '%u'", pItem->GetGUIDLow());
+        CharacterDatabase.PExecute("INSERT INTO `character_item_morph` (`item_guid`, `player_guid`, `display_id`, `expire_time`) VALUES ('%u', '%u', '%u', '%u')",
+                                   pItem->GetGUIDLow(), GetGUIDLow(), record.displayId, uint32(record.expireTime));
+        CharacterDatabase.CommitTransaction();
+    }
+
     return true;
 }
 
@@ -548,17 +627,19 @@ bool Player::SetItemVisualOverride(uint8 slot, uint32 displayId)
  * @param itemEntry The equipped item entry to look for.
  * @param displayId The display to show (display id or item entry, see
  *                  SetItemVisualOverride), 0 restores the real look.
+ * @param expireSeconds Seconds the look stays when persist is set (0 = no expiry).
+ * @param persist Save the look so it survives relogging.
  * @return true when the override was applied (or the item was not found and a
  *         reset was requested).
  */
-bool Player::SetItemVisualOverrideByItemEntry(uint32 itemEntry, uint32 displayId)
+bool Player::SetItemVisualOverrideByItemEntry(uint32 itemEntry, uint32 displayId, uint32 expireSeconds, bool persist)
 {
     for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
     {
         Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
         if (pItem && pItem->GetEntry() == itemEntry)
         {
-            return SetItemVisualOverride(slot, displayId);
+            return SetItemVisualOverride(slot, displayId, expireSeconds, persist);
         }
     }
 
@@ -575,9 +656,431 @@ void Player::ResetItemVisualOverrides()
         if (m_itemVisualOverrideEntries[slot])
         {
             m_itemVisualOverrideEntries[slot] = 0;
+            m_itemVisualOverrideSlotItems[slot] = 0;
             SetVisibleItemSlot(slot, GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
         }
     }
+}
+
+/**
+ * @brief The item entry an equipment slot currently shows, morphs included.
+ *
+ * ITEM_VISUAL_PERSIST_PATCH: used when the equipmentCache of the character
+ * (the item list of the character selection screen) is saved. A bought look
+ * (character_item_morph) of the equipped item is resolved to the item entry it
+ * displays, so the login character list shows the morphed gear exactly like
+ * the game world does. Looks that only exist as synthetic display-only
+ * entries have no database item, so those keep the real item entry.
+ *
+ * @param slot The equipment slot.
+ * @return The shown item entry - the real entry when the slot is empty of
+ *         looks or holds no item at all.
+ */
+uint32 Player::GetShownItemEntryForSlot(uint8 slot) const
+{
+    Item* pItem = (slot < EQUIPMENT_SLOT_END) ? GetItemByPos(INVENTORY_SLOT_BAG_0, slot) : NULL;
+
+    if (!pItem)
+    {
+        return 0;
+    }
+
+    std::map<uint32, ItemMorphRecord>::const_iterator itr = m_itemMorphRecords.find(pItem->GetGUIDLow());
+
+    if (itr != m_itemMorphRecords.end() && (!itr->second.expireTime || itr->second.expireTime > time(NULL)))
+    {
+        uint32 entry = ResolveItemVisualEntry(itr->second.displayId, pItem->GetProto());
+
+        if (entry && !ObjectMgr::IsItemVisualFakeEntry(entry))
+        {
+            return entry;
+        }
+    }
+
+    return pItem->GetEntry();
+}
+
+/**
+ * @brief Loads the saved item looks of the character (character_item_morph).
+ *
+ * Called BEFORE _LoadInventory: SetVisibleItemSlot applies the records while
+ * the equipment is placed, so login shows the bought looks without any extra
+ * pass. Expired records are removed from the database right away.
+ *
+ * @param result SELECT item_guid, display_id, expire_time FROM character_item_morph
+ */
+void Player::_LoadItemMorphs(QueryResult* result)
+{
+    time_t now = time(NULL);
+
+    if (result)
+    {
+        do
+        {
+            Field* fields = result->Fetch();
+            uint32 itemGuid = fields[0].GetUInt32();
+            uint32 displayId = fields[1].GetUInt32();
+            time_t expireTime = time_t(fields[2].GetUInt64());
+
+            if (expireTime && expireTime <= now)
+            {
+                CharacterDatabase.PExecute("DELETE FROM `character_item_morph` WHERE `item_guid` = '%u'", itemGuid);
+                continue;                                   // the bought look ran out while offline
+            }
+
+            ItemMorphRecord record;
+            record.displayId = displayId;
+            record.expireTime = expireTime;
+            m_itemMorphRecords[itemGuid] = record;
+        }
+        while (result->NextRow());
+
+        delete result;
+    }
+}
+
+/**
+ * @brief Loads the rented items of the character (character_item_expiry).
+ *
+ * Expired items are destroyed by the first timed-item sweep shortly after
+ * login (with a message), non-expired ones stay in m_itemExpiries.
+ *
+ * @param result SELECT item_guid, expire_time FROM character_item_expiry
+ */
+void Player::_LoadItemExpiries(QueryResult* result)
+{
+    time_t now = time(NULL);
+
+    if (result)
+    {
+        do
+        {
+            Field* fields = result->Fetch();
+            uint32 itemGuid = fields[0].GetUInt32();
+            time_t expireTime = time_t(fields[1].GetUInt64());
+            m_itemExpiries[itemGuid] = expireTime;
+        }
+        while (result->NextRow());
+
+        delete result;
+    }
+
+    // forget rows of items the character no longer owns (deleted / mailed away)
+    for (std::map<uint32, time_t>::iterator itr = m_itemExpiries.begin(); itr != m_itemExpiries.end();)
+    {
+        if (!GetItemByGuid(ObjectGuid(HIGHGUID_ITEM, itr->first)))
+        {
+            CharacterDatabase.PExecute("DELETE FROM `character_item_expiry` WHERE `item_guid` = '%u'", itr->first);
+            m_itemExpiries.erase(itr++);
+        }
+        else
+        {
+            ++itr;
+        }
+    }
+
+    // Expired rentals are NOT destroyed here: the player is still loading, so
+    // the sweep would run outside the world. The first UpdateTimedItems() pass
+    // (3 seconds after login, see the Player constructor) removes them with
+    // the proper chat message.
+}
+
+/**
+ * @brief Puts an item on a rental timer: it is destroyed when the time is over.
+ *
+ * @param item The item to time (must belong to this player).
+ * @param seconds Lifetime in seconds, 0 removes the timer.
+ */
+void Player::SetItemExpiry(Item* item, uint32 seconds)
+{
+    if (!item || item->GetOwnerGuid() != GetObjectGuid())
+    {
+        return;
+    }
+
+    uint32 itemGuid = item->GetGUIDLow();
+
+    if (seconds == 0)
+    {
+        if (m_itemExpiries.erase(itemGuid))
+        {
+            CharacterDatabase.PExecute("DELETE FROM `character_item_expiry` WHERE `item_guid` = '%u'", itemGuid);
+        }
+        return;
+    }
+
+    time_t expireTime = time(NULL) + seconds;
+    m_itemExpiries[itemGuid] = expireTime;
+
+    CharacterDatabase.BeginTransaction();
+    CharacterDatabase.PExecute("DELETE FROM `character_item_expiry` WHERE `item_guid` = '%u'", itemGuid);
+    CharacterDatabase.PExecute("INSERT INTO `character_item_expiry` (`item_guid`, `player_guid`, `expire_time`) VALUES ('%u', '%u', '%u')",
+                               itemGuid, GetGUIDLow(), uint32(expireTime));
+    CharacterDatabase.CommitTransaction();
+}
+
+/**
+ * @brief Seconds until the item expires, 0 when it has no timer.
+ *
+ * @param item The item to ask.
+ * @return Remaining seconds (0 when the item has no rental time).
+ */
+uint32 Player::GetItemExpiryRemaining(Item* item) const
+{
+    if (!item)
+    {
+        return 0;
+    }
+
+    std::map<uint32, time_t>::const_iterator itr = m_itemExpiries.find(item->GetGUIDLow());
+
+    if (itr == m_itemExpiries.end())
+    {
+        return 0;
+    }
+
+    time_t now = time(NULL);
+    return itr->second > now ? uint32(itr->second - now) : 0;
+}
+
+/**
+ * @brief Periodic expiry sweep: destroys rented items whose time ran out and
+ *        restores item looks whose morph time ran out.
+ *
+ * Called from Player::Update every TimedItem.CheckInterval seconds and once
+ * after login. Runs offline-expired rows are already cleaned at load time.
+ */
+void Player::UpdateTimedItems()
+{
+    time_t now = time(NULL);
+
+    // rented items first (destroying an item may also own a morph record)
+    for (std::map<uint32, time_t>::iterator itr = m_itemExpiries.begin(); itr != m_itemExpiries.end();)
+    {
+        if (itr->second > now)
+        {
+            ++itr;
+            continue;                                       // still valid
+        }
+
+        uint32 itemGuid = itr->first;
+        Item* item = GetItemByGuid(ObjectGuid(HIGHGUID_ITEM, itemGuid));
+
+        if (item)
+        {
+            std::string name = item->GetProto() ? item->GetProto()->Name1 : "Unknown";
+
+            if (item->IsEquipped())
+            {
+                DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
+            }
+            else
+            {
+                uint32 count = item->GetCount();
+                DestroyItemCount(item, count, true);
+            }
+
+            if (GetSession())
+            {
+                GetSession()->SendNotification("%s ran out of time and was removed.", name.c_str());
+                ChatHandler(GetSession()).PSendSysMessage("[Rental] %s ran out of time and was removed.", name.c_str());
+            }
+        }
+
+        // also forget a morph bound to the destroyed item
+        m_itemMorphRecords.erase(itemGuid);
+
+        CharacterDatabase.BeginTransaction();
+        CharacterDatabase.PExecute("DELETE FROM `character_item_expiry` WHERE `item_guid` = '%u'", itemGuid);
+        CharacterDatabase.PExecute("DELETE FROM `character_item_morph` WHERE `item_guid` = '%u'", itemGuid);
+        CharacterDatabase.CommitTransaction();
+
+        m_itemExpiries.erase(itr++);
+    }
+
+    // bought looks whose time ran out
+    for (std::map<uint32, ItemMorphRecord>::iterator itr = m_itemMorphRecords.begin(); itr != m_itemMorphRecords.end();)
+    {
+        if (!itr->second.expireTime || itr->second.expireTime > now)
+        {
+            ++itr;
+            continue;                                       // permanent or still valid
+        }
+
+        uint32 itemGuid = itr->first;
+
+        // restore the real look while the item is equipped
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+
+            if (pItem && pItem->GetGUIDLow() == itemGuid)
+            {
+                m_itemVisualOverrideEntries[slot] = 0;
+                m_itemVisualOverrideSlotItems[slot] = 0;
+                SetVisibleItemSlot(slot, pItem);
+                break;
+            }
+        }
+
+        if (GetSession())
+        {
+            ChatHandler(GetSession()).PSendSysMessage("[ItemMorph] The bought look of one of your items ran out of time.");
+        }
+
+        CharacterDatabase.PExecute("DELETE FROM `character_item_morph` WHERE `item_guid` = '%u'", itemGuid);
+        m_itemMorphRecords.erase(itr++);
+    }
+}
+
+/**
+ * @brief Loads the Magic Gold balance of the character.
+ *
+ * @param result SELECT mg FROM character_magic_gold
+ */
+void Player::_LoadMagicGold(QueryResult* result)
+{
+    if (result)
+    {
+        m_magicGold = result->Fetch()[0].GetUInt32();
+        delete result;
+    }
+}
+
+/**
+ * @brief Adds or removes Magic Gold, clamped to [0, MagicGold.Max].
+ *
+ * @param amount Positive to add, negative to spend.
+ * @param announce Send a chat message about the change.
+ * @return false when a deduction was not covered by the balance (nothing changes).
+ */
+bool Player::ModifyMagicGold(int32 amount, bool announce)
+{
+    if (amount == 0)
+    {
+        return true;
+    }
+
+    if (amount < 0 && uint32(-amount) > m_magicGold)
+    {
+        return false;                                       // not enough Magic Gold
+    }
+
+    int64 newValue = int64(m_magicGold) + amount;
+    uint32 cap = sWorld.getConfig(CONFIG_UINT32_MAGIC_GOLD_MAX);
+
+    if (newValue < 0)
+    {
+        newValue = 0;
+    }
+
+    if (newValue > cap)
+    {
+        newValue = cap;
+    }
+
+    m_magicGold = uint32(newValue);
+
+    if (announce && GetSession())
+    {
+        if (amount > 0)
+        {
+            ChatHandler(GetSession()).PSendSysMessage("|cff00ccff[Magic Gold]|r You receive |cff00ff00%u|r Magic Gold (balance: |cffffff00%u|r).", uint32(amount), m_magicGold);
+        }
+        else
+        {
+            ChatHandler(GetSession()).PSendSysMessage("|cff00ccff[Magic Gold]|r You spend |cffff5555%u|r Magic Gold (balance: |cffffff00%u|r).", uint32(-amount), m_magicGold);
+        }
+    }
+
+    return true;
+}
+
+/**
+ * @brief The VIP level clamped by the VIP.MaxLevel config.
+ *
+ * @return Effective VIP level (0..VIP.MaxLevel).
+ */
+uint8 Player::GetEffectiveVIPLevel() const
+{
+    uint32 max = sWorld.getConfig(CONFIG_UINT32_VIP_MAX_LEVEL);
+    return m_vipLevel > max ? uint8(max) : m_vipLevel;
+}
+
+/**
+ * @brief Sets the VIP level of the account (live, without relogging).
+ *
+ * @param level The new VIP level (0..VIP.MaxLevel, higher values are clamped).
+ * @param writeToDb Also update the realmd table account_vip.
+ */
+void Player::SetVIPLevel(uint8 level, bool writeToDb)
+{
+    uint32 max = sWorld.getConfig(CONFIG_UINT32_VIP_MAX_LEVEL);
+    m_vipLevel = level > max ? uint8(max) : level;
+
+    if (writeToDb)
+    {
+        if (m_vipLevel > 0)
+        {
+            LoginDatabase.PExecute("REPLACE INTO `account_vip` (`id`, `level`) VALUES ('%u', '%u')", GetSession()->GetAccountId(), m_vipLevel);
+        }
+        else
+        {
+            LoginDatabase.PExecute("DELETE FROM `account_vip` WHERE `id` = '%u'", GetSession()->GetAccountId());
+        }
+    }
+
+    // the level cap changed: refresh what the client shows for the XP bar
+    SetUInt32Value(PLAYER_FIELD_MAX_LEVEL, GetMaxLevel());
+
+    if (GetSession())
+    {
+        ChatHandler(GetSession()).PSendSysMessage("[VIP] Your VIP level is now %u. Level cap: %u.", m_vipLevel, GetMaxLevel());
+    }
+}
+
+/**
+ * @brief The character level cap of this account: world cap + VIP levels.
+ *
+ * @return The per-account maximum character level (capped at the MAX_LEVEL the
+ *         core supports, 100).
+ */
+uint32 Player::GetMaxLevel() const
+{
+    uint32 cap = sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL) + GetEffectiveVIPLevel();
+    return cap > MAX_LEVEL ? MAX_LEVEL : cap;
+}
+
+/**
+ * @brief The player name with the VIP color markup for chat channels.
+ *
+ * @return The plain name for non-VIP players or when the feature is off,
+ *         otherwise "|cffRRGGBBname|r".
+ */
+std::string Player::GetVIPChatName() const
+{
+    if (!sWorld.getConfig(CONFIG_BOOL_VIP_CHAT_COLOR_ENABLE))
+    {
+        return std::string(GetName());
+    }
+
+    uint8 vip = GetEffectiveVIPLevel();
+
+    if (!vip)
+    {
+        return std::string(GetName());
+    }
+
+    uint32 color = sWorld.GetVIPChatColor(vip);
+
+    if (!color)
+    {
+        return std::string(GetName());
+    }
+
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "|cff%06x%s|r", color, GetName());
+    return std::string(buffer);
 }
 
 /**

@@ -740,7 +740,12 @@ void Pet::GivePetXP(uint32 xp)
     }
 
     uint32 level = getLevel();
-    uint32 maxlevel = std::min(sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL), GetOwner()->getLevel());
+
+    // VIP_PATCH: pets follow the owner's account level cap (world cap + VIP levels)
+    Player* petOwner = GetOwner() ? GetOwner()->ToPlayer() : NULL;
+    uint32 maxlevel = petOwner
+                      ? std::min(petOwner->GetMaxLevel(), petOwner->getLevel())
+                      : sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
 
     // pet not receive xp for level equal to owner level
     if (level >= maxlevel)

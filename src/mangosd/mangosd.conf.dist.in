@@ -1114,6 +1114,109 @@ LivingWorld.AnchorPolicyMask              = 0
 #        the existing Rate.Health option for that).
 #        Default: 1     - off (original healing)
 #
+#    MagicGold.Enable
+#        Master switch for the Magic Gold (MG) currency. MG is a second,
+#        script-controlled currency per character. For now characters earn
+#        MG by killing other characters (honorable PvP kills). Scripts can
+#        read and spend it through the Eluna methods GetMagicGold /
+#        ModifyMagicGold / SetMagicGold.
+#        Default: 1     - enabled
+#
+#    MagicGold.Max
+#        Maximum Magic Gold a character can hold.
+#        Default: 10000000
+#
+#    MagicGold.PvPKill.Base
+#        Magic Gold awarded for killing another character (base part).
+#        The victim must be honor eligible (no gray-level farming).
+#        Default: 10
+#
+#    MagicGold.PvPKill.PerVictimLevel
+#        Extra Magic Gold per level of the killed character. The final award
+#        is (Base + PerVictimLevel * victim level), multiplied by the VIP
+#        Magic Gold rate of the killer.
+#        Default: 0.5
+#
+#    VIP.MaxLevel
+#        Highest VIP level an account can have. Each VIP level raises the
+#        character level cap by one above MaxPlayerLevel for the whole
+#        account (VIP 1 can reach MaxPlayerLevel + 1, VIP 10 reaches
+#        MaxPlayerLevel + 10). VIP levels are stored per account in the
+#        realmd database table account_vip and are read at login; scripts
+#        set them with the Eluna method Player:SetVIPLevel.
+#        Default: 10    - (1..10)
+#
+#    VIP.Loot.ChancePerLevel
+#        Bonus loot drop chance per VIP level, in percent of the base
+#        chance (2.0 = every VIP level makes each non-grouped loot entry
+#        2 percent more likely to drop; VIP 10 = +20 percent).
+#        Default: 2.0
+#
+#    VIP.StealthDetect.PerLevel
+#        Yards added to the stealth detection range per VIP level, so
+#        higher VIP ranks spot stealthed characters from further away.
+#        Default: 1.5
+#
+#    VIP.MG.RatePerLevel
+#        Magic Gold gain multiplier per VIP level (0.10 = +10 percent MG
+#        per level; VIP 10 earns twice the base MG).
+#        Default: 0.10
+#
+#    VIP.XP.RatePerLevel
+#        Experience gain multiplier per VIP level (0.05 = +5 percent XP
+#        per level). Applies to all XP sources (kills, quests, explore).
+#        Default: 0.05
+#
+#    VIP.Honor.RatePerLevel
+#        Honor gain multiplier per VIP level (0.05 = +5 percent per level).
+#        Default: 0.05
+#
+#    VIP.Reputation.RatePerLevel
+#        Reputation gain multiplier per VIP level (0.05 = +5 percent per
+#        level). Applies to kill and quest reputation.
+#        Default: 0.05
+#
+#    VIP.ChatColor.Enable
+#        Colorize the sender name in chat channels (General, Trade, custom
+#        channels) by the VIP level of the sender. Non-VIP players keep the
+#        normal name. Disable if your client build does not render the
+#        colors.
+#        Default: 1     - enabled
+#
+#    VIP.ChatColor.1 .. VIP.ChatColor.10
+#        Name color of each VIP level as RRGGBB hex. Set to 000000 to keep
+#        the default color for that level.
+#        Defaults: 1=00FF00 2=33FF77 3=00CCEE 4=3388FF 5=8855FF
+#                  6=FF55DD 7=FF8800 8=FFCC00 9=FF5500 10=FF2222
+#
+#
+#    GlobalPvP.Enable
+#        Master switch for the shared free-for-all PvP map (GLOBAL_PVP_PATCH).
+#        While enabled the map below is created ONCE and shared by every
+#        character: no instance copies and no instance binds - everyone on the
+#        map sees and can attack everyone (free-for-all, both factions).
+#        Default: 1     - enabled
+#
+#    GlobalPvP.Map / GlobalPvP.Zone / GlobalPvP.Area
+#        The map / zone / area of the PvP spot. Defaults are the outdoor part of
+#        Old Hillsbrad Foothills (The Escape From Durnholde): map 560, zone
+#        2367, area 2370 (Durnholde).
+#
+#    GlobalPvP.X / .Y / .Z / .O
+#        Landing position inside the map, used by the teleport services and as
+#        the hearthstone location.
+#
+#    GlobalPvP.SetHomebind
+#        While enabled every character's hearthstone (homebind) is moved to the
+#        PvP position at login, so the Hearthstone always ports there.
+#        Default: 1     - enabled
+#
+#    TimedItem.CheckInterval
+#        Seconds between expiry sweeps while a character is online. The
+#        sweep removes bought items whose rental time is over, and restores
+#        item looks whose morph time is over (both also send a message).
+#        Default: 10    - (2..3600)
+#
 #    ItemVisual.Enable
 #        Master switch for the item visual override system (temporary
 #        transmogrification-like display changes of equipped items). When
@@ -1246,6 +1349,38 @@ Rate.Damage.Ranged                        = 1.0
 Rate.Damage.Spell                         = 1.0
 Rate.Healing                              = 1.0
 ItemVisual.Enable                         = 1
+MagicGold.Enable                         = 1
+MagicGold.Max                            = 10000000
+MagicGold.PvPKill.Base                   = 10
+MagicGold.PvPKill.PerVictimLevel         = 0.5
+VIP.MaxLevel                             = 10
+VIP.Loot.ChancePerLevel                  = 2.0
+VIP.StealthDetect.PerLevel               = 1.5
+VIP.MG.RatePerLevel                      = 0.10
+VIP.XP.RatePerLevel                      = 0.05
+VIP.Honor.RatePerLevel                   = 0.05
+VIP.Reputation.RatePerLevel              = 0.05
+VIP.ChatColor.Enable                     = 1
+VIP.ChatColor.1                          = 00FF00
+VIP.ChatColor.2                          = 33FF77
+VIP.ChatColor.3                          = 00CCEE
+VIP.ChatColor.4                          = 3388FF
+VIP.ChatColor.5                          = 8855FF
+VIP.ChatColor.6                          = FF55DD
+VIP.ChatColor.7                          = FF8800
+VIP.ChatColor.8                          = FFCC00
+VIP.ChatColor.9                          = FF5500
+VIP.ChatColor.10                         = FF2222
+GlobalPvP.Enable                          = 1
+GlobalPvP.Map                             = 560
+GlobalPvP.Zone                            = 2367
+GlobalPvP.Area                            = 2370
+GlobalPvP.X                               = 2040.62
+GlobalPvP.Y                               = 250.017
+GlobalPvP.Z                               = 62.7466
+GlobalPvP.O                               = 6.26859
+GlobalPvP.SetHomebind                     = 1
+TimedItem.CheckInterval                  = 10
 Creature.DisplayHealthAsPercent           = 1
 Rate.Creature.Aggro                       = 1
 CreatureRespawnAggroDelay                 = 5000

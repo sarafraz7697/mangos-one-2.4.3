@@ -659,6 +659,60 @@ void World::LoadConfigSettings(bool reload)
     setConfig(CONFIG_BOOL_CREATURE_HEALTH_AS_PERCENT, "Creature.DisplayHealthAsPercent", true);
     setConfig(CONFIG_BOOL_ITEM_VISUAL_OVERRIDE_ENABLE, "ItemVisual.Enable", true);
 
+    // MAGIC_GOLD_PATCH: Magic Gold currency, earned by killing other characters
+    setConfig(CONFIG_BOOL_MAGIC_GOLD_ENABLE,                    "MagicGold.Enable", true);
+    setConfigMinMax(CONFIG_UINT32_MAGIC_GOLD_MAX,               "MagicGold.Max", 10000000u, 0u, 1000000000u);
+    setConfigMinMax(CONFIG_FLOAT_MAGIC_GOLD_PVPKILL_BASE,       "MagicGold.PvPKill.Base", 10.0f, 0.0f, 100000.0f);
+    setConfigMinMax(CONFIG_FLOAT_MAGIC_GOLD_PVPKILL_PER_VICTIM_LEVEL, "MagicGold.PvPKill.PerVictimLevel", 0.5f, 0.0f, 1000.0f);
+
+    // VIP_PATCH: 10 VIP levels, per-level bonuses (all stack on top of the world rates)
+    setConfigMinMax(CONFIG_UINT32_VIP_MAX_LEVEL,                "VIP.MaxLevel", 10u, 1u, 10u);
+    setConfigMinMax(CONFIG_FLOAT_VIP_LOOT_CHANCE_PER_LEVEL,     "VIP.Loot.ChancePerLevel", 2.0f, 0.0f, 100.0f);
+    setConfigMinMax(CONFIG_FLOAT_VIP_STEALTH_DETECT_PER_LEVEL,  "VIP.StealthDetect.PerLevel", 1.5f, 0.0f, 30.0f);
+    setConfigMinMax(CONFIG_FLOAT_VIP_MG_RATE_PER_LEVEL,         "VIP.MG.RatePerLevel", 0.10f, 0.0f, 10.0f);
+    setConfigMinMax(CONFIG_FLOAT_VIP_XP_RATE_PER_LEVEL,         "VIP.XP.RatePerLevel", 0.05f, 0.0f, 10.0f);
+    setConfigMinMax(CONFIG_FLOAT_VIP_HONOR_RATE_PER_LEVEL,      "VIP.Honor.RatePerLevel", 0.05f, 0.0f, 10.0f);
+    setConfigMinMax(CONFIG_FLOAT_VIP_REPUTATION_RATE_PER_LEVEL, "VIP.Reputation.RatePerLevel", 0.05f, 0.0f, 10.0f);
+    setConfig(CONFIG_BOOL_VIP_CHAT_COLOR_ENABLE,                "VIP.ChatColor.Enable", true);
+
+    // VIP_PATCH: chat name colors, RRGGBB hex per level ("" or 000000 = keep the default color)
+    {
+        static char const* const vipColorKeys[11] =
+        {
+            NULL,
+            "VIP.ChatColor.1",  "VIP.ChatColor.2",  "VIP.ChatColor.3",  "VIP.ChatColor.4",  "VIP.ChatColor.5",
+            "VIP.ChatColor.6",  "VIP.ChatColor.7",  "VIP.ChatColor.8",  "VIP.ChatColor.9",  "VIP.ChatColor.10"
+        };
+        static char const* const vipColorDefaults[11] =
+        {
+            NULL,
+            "00FF00", "33FF77", "00CCEE", "3388FF", "8855FF",
+            "FF55DD", "FF8800", "FFCC00", "FF5500", "FF2222"
+        };
+        for (int i = 1; i <= 10; ++i)
+        {
+            std::string color = sConfig.GetStringDefault(vipColorKeys[i], vipColorDefaults[i]);
+            m_vipChatColors[i] = strtoul(color.c_str(), NULL, 16) & 0xFFFFFF;
+        }
+    }
+
+    // TIMED_ITEM_PATCH: how often expired items / expired item morphs are swept while a player is online
+    setConfigMinMax(CONFIG_UINT32_TIMED_ITEM_CHECK_INTERVAL,    "TimedItem.CheckInterval", 10u, 2u, 3600u);
+
+    // GLOBAL_PVP_PATCH: one shared, non-instanced free-for-all PvP map for everyone.
+    // The map id must exist in Map.dbc; it is normally a dungeon map (Old Hillsbrad
+    // Foothills, "The Escape From Durnholde") but is created once and shared by ALL
+    // characters - no instance copies, no instance saves, everyone sees everyone.
+    setConfig(CONFIG_BOOL_GLOBAL_PVP_ENABLE,                    "GlobalPvP.Enable", true);
+    setConfigMinMax(CONFIG_UINT32_GLOBAL_PVP_MAP,               "GlobalPvP.Map", 560u, 0u, 1000u);
+    setConfigMinMax(CONFIG_UINT32_GLOBAL_PVP_ZONE,              "GlobalPvP.Zone", 2367u, 0u, 100000u);
+    setConfigMinMax(CONFIG_UINT32_GLOBAL_PVP_AREA,              "GlobalPvP.Area", 2370u, 0u, 100000u);
+    setConfigMinMax(CONFIG_FLOAT_GLOBAL_PVP_X,                  "GlobalPvP.X", 2040.62f, -17066.0f, 17066.0f);
+    setConfigMinMax(CONFIG_FLOAT_GLOBAL_PVP_Y,                  "GlobalPvP.Y", 250.017f, -17066.0f, 17066.0f);
+    setConfigMinMax(CONFIG_FLOAT_GLOBAL_PVP_Z,                  "GlobalPvP.Z", 62.7466f, -1000.0f, 4000.0f);
+    setConfigMinMax(CONFIG_FLOAT_GLOBAL_PVP_O,                  "GlobalPvP.O", 6.26859f, 0.0f, 6.2832f);
+    setConfig(CONFIG_BOOL_GLOBAL_PVP_SET_HOMEBIND,              "GlobalPvP.SetHomebind", true);
+
 #ifdef ENABLE_PLAYERBOTS
     setConfig(CONFIG_BOOL_PLAYERBOT_DISABLE, "PlayerbotAI.DisableBots", true);
     setConfig(CONFIG_BOOL_PLAYERBOT_DEBUGWHISPER, "PlayerbotAI.DebugWhisper", false);

@@ -1291,3 +1291,197 @@ TrainerSpellState Player::GetTrainerSpellState(TrainerSpell const* trainer_spell
 
     return TRAINER_SPELL_GREEN;
 }
+
+/**
+ * @brief Personal trainer spell price in copper.
+ *
+ * PERSONAL_TRAINER_PATCH: the personal trainer has no npc_trainer database
+ * rows, so the price is derived from the required level: cheap at low levels,
+ * roughly normal trainer prices at the level cap.
+ * (level 10 ~ 30s, level 40 ~ 50s, level 60 ~ 1.5g, level 70 ~ 2g)
+ *
+ * @param reqLevel The level the spell requires.
+ * @return The training cost in copper.
+ */
+static uint32 GetPersonalTrainerSpellCost(uint32 reqLevel)
+{
+    return 100 + reqLevel * reqLevel * 2;
+}
+
+/**
+ * @brief Fills the character's own trainer list from the DBC data.
+ *
+ * PERSONAL_TRAINER_PATCH: the "Learn Skill" service of the hearthstone opens a
+ * real trainer page for the character without an NPC. The list contains:
+ *   - every class spell the character could learn from class trainers
+ *     (same filters as the ".learn all_myclass" GM command: no talents, no
+ *     broken spells, matching class/race), and
+ *   - the weapon and shield proficiency spells the class may learn.
+ * The level requirements come from SkillRaceClassInfo like for real trainers,
+ * so spells unlock row by row while leveling.
+ */
+void Player::BuildPersonalTrainerSpells()
+{
+    m_personalTrainerSpells.clear();
+
+    ChrClassesEntry const* clsEntry = sChrClassesStore.LookupEntry(getClass());
+    if (!clsEntry)
+    {
+        return;
+    }
+
+    uint32 family = clsEntry->SpellClassSet;
+
+    // ---- class spells -------------------------------------------------------
+    for (uint32 i = 0; i < sSkillLineAbilityStore.GetNumRows(); ++i)
+    {
+        SkillLineAbilityEntry const* entry = sSkillLineAbilityStore.LookupEntry(i);
+        if (!entry)
+        {
+            continue;
+        }
+
+        SpellEntry const* spellInfo = sSpellStore.LookupEntry(entry->Spell);
+        if (!spellInfo)
+        {
+            continue;
+        }
+
+        // skip server-side/triggered spells
+        if (spellInfo->SpellLevel == 0)
+        {
+            continue;
+        }
+
+        // skip wrong class/race skills
+        if (!IsSpellFitByClassAndRace(spellInfo->ID))
+        {
+            continue;
+        }
+
+        // skip other spell families
+        if (spellInfo->SpellClassSet != family)
+        {
+            continue;
+        }
+
+        // skip spells with first rank learned as talent (and all talents then also)
+        uint32 first_rank = sSpellMgr.GetFirstSpellInChain(spellInfo->ID);
+        if (GetTalentSpellCost(first_rank) > 0)
+        {
+            continue;
+        }
+
+        // skip broken spells
+        if (!SpellMgr::IsSpellValid(spellInfo, this, false))
+        {
+            continue;
+        }
+
+        uint32 reqLevel = 0;
+        IsSpellFitByClassAndRace(spellInfo->ID, &reqLevel);
+        reqLevel = std::max(reqLevel, uint32(spellInfo->SpellLevel));
+
+        m_personalTrainerSpells[spellInfo->ID] =
+            TrainerSpell(spellInfo->ID, GetPersonalTrainerSpellCost(reqLevel), 0, 0, reqLevel, false);
+    }
+
+    // ---- weapon / shield proficiency skills ---------------------------------
+    static uint32 const weaponSkillSpells[] =
+    {
+        196,    // One-Handed Axes
+        197,    // Two-Handed Axes
+        198,    // One-Handed Maces
+        199,    // Two-Handed Maces
+        200,    // Polearms
+        201,    // One-Handed Swords
+        202,    // Two-Handed Swords
+        227,    // Staves
+        264,    // Bows
+        266,    // Guns
+        1180,   // Daggers
+        2567,   // Thrown
+        5009,   // Wands
+        5011,   // Crossbows
+        9116,   // Shields
+        15590   // Fist Weapons
+    };
+
+    for (size_t i = 0; i < sizeof(weaponSkillSpells) / sizeof(weaponSkillSpells[0]); ++i)
+    {
+        uint32 spellId = weaponSkillSpells[i];
+
+        SpellEntry const* spellInfo = sSpellStore.LookupEntry(spellId);
+        if (!spellInfo)
+        {
+            continue;
+        }
+
+        // only the skills this class/race may learn (SkillRaceClassInfo)
+        uint32 reqLevel = 0;
+        if (!IsSpellFitByClassAndRace(spellId, &reqLevel))
+        {
+            continue;
+        }
+
+        if (m_personalTrainerSpells.find(spellId) != m_personalTrainerSpells.end())
+        {
+            continue;
+        }
+
+        m_personalTrainerSpells[spellId] =
+            TrainerSpell(spellId, GetPersonalTrainerSpellCost(reqLevel), 0, 0, reqLevel, false);
+    }
+}
+
+/**
+ * @brief Buys one spell from the character's own trainer list.
+ *
+ * Mirrors WorldSession::HandleTrainerBuySpellOpcode for the trainer-less
+ * personal trainer: the spell must be in the generated list, GREEN (level and
+ * previous rank known) and the gold price must be paid. Called from the
+ * CMSG_TRAINER_BUY_SPELL handler when the trainer guid is the player itself.
+ *
+ * @param spellId The spell the client wants to learn.
+ * @return true when the spell was learned and paid.
+ */
+bool Player::LearnPersonalTrainerSpell(uint32 spellId)
+{
+    TrainerSpellMap::const_iterator itr = m_personalTrainerSpells.find(spellId);
+
+    if (itr == m_personalTrainerSpells.end())
+    {
+        return false;                                      // not in the personal trainer list
+    }
+
+    TrainerSpell const* trainer_spell = &itr->second;
+
+    uint32 reqLevel = 0;
+    if (!IsSpellFitByClassAndRace(trainer_spell->spell, &reqLevel))
+    {
+        return false;
+    }
+
+    reqLevel = std::max(reqLevel, trainer_spell->reqLevel);
+
+    if (GetTrainerSpellState(trainer_spell, reqLevel) != TRAINER_SPELL_GREEN)
+    {
+        return false;                                      // too low level / rank missing / already known
+    }
+
+    if (GetMoney() < trainer_spell->spellCost)
+    {
+        ChatHandler(GetSession()).PSendSysMessage("You need %u copper to train that spell.", trainer_spell->spellCost);
+        return false;
+    }
+
+    ModifyMoney(-int32(trainer_spell->spellCost));
+    learnSpell(trainer_spell->spell, false);
+
+    WorldPacket data(SMSG_TRAINER_BUY_SUCCEEDED, 12);
+    data << GetObjectGuid();                               // the "trainer" is the player
+    data << uint32(spellId);
+    GetSession()->SendPacket(&data);
+
+    return true;
+}

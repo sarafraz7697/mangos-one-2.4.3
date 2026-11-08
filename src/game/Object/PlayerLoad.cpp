@@ -281,6 +281,19 @@ bool Player::LoadFromDB(ObjectGuid guid, SqlQueryHolder* holder)
 
     m_name = fields[2].GetCppString();
 
+    // VIP_PATCH: load the account-wide VIP level before anything level related runs
+    // (InitStatsForLevel / GiveXP use GetMaxLevel()). One indexed row from realmd.
+    {
+        m_vipLevel = 0;
+        QueryResult* vipResult = LoginDatabase.PQuery("SELECT `level` FROM `account_vip` WHERE `id` = '%u'", GetSession()->GetAccountId());
+
+        if (vipResult)
+        {
+            m_vipLevel = vipResult->Fetch()[0].GetUInt8();
+            delete vipResult;
+        }
+    }
+
     // check name limitations
     if (ObjectMgr::CheckPlayerName(m_name) != CHAR_NAME_SUCCESS ||
         (GetSession()->GetSecurity() == SEC_PLAYER && sObjectMgr.IsReservedName(m_name)))
@@ -326,6 +339,9 @@ bool Player::LoadFromDB(ObjectGuid guid, SqlQueryHolder* holder)
         money = MAX_MONEY_AMOUNT;
     }
     SetMoney(money);
+
+    // MAGIC_GOLD_PATCH: load the Magic Gold balance (async through the login holder)
+    _LoadMagicGold(holder->GetResult(PLAYER_LOGIN_QUERY_LOADMAGICGOLD));
 
     SetUInt32Value(PLAYER_BYTES, fields[9].GetUInt32());
     SetUInt32Value(PLAYER_BYTES_2, fields[10].GetUInt32());
@@ -723,8 +739,15 @@ bool Player::LoadFromDB(ObjectGuid guid, SqlQueryHolder* holder)
     // must be before inventory (some items required reputation check)
     m_reputationMgr.LoadFromDB(holder->GetResult(PLAYER_LOGIN_QUERY_LOADREPUTATION));
 
+    // ITEM_VISUAL_PERSIST_PATCH: saved item looks load before the inventory, so
+    // SetVisibleItemSlot applies them while the equipment is placed at login
+    _LoadItemMorphs(holder->GetResult(PLAYER_LOGIN_QUERY_LOADITEMMORPHS));
+
     _LoadInventory(holder->GetResult(PLAYER_LOGIN_QUERY_LOADINVENTORY), time_diff);
     _LoadItemLoot(holder->GetResult(PLAYER_LOGIN_QUERY_LOADITEMLOOT));
+
+    // TIMED_ITEM_PATCH: rented items (expired ones are swept right away)
+    _LoadItemExpiries(holder->GetResult(PLAYER_LOGIN_QUERY_LOADITEMEXPIRY));
 
     // update items with duration and realtime
     UpdateItemDuration(time_diff, true);
@@ -2204,9 +2227,16 @@ bool Player::_LoadHomeBind(QueryResult* result)
 
         MapEntry const* bindMapEntry = sMapStore.LookupEntry(m_homebindMapId);
 
+        // GLOBAL_PVP_PATCH: the homebind may point into the shared PvP map.
+        // Map 560 is flagged instanceable in Map.dbc, but the world server
+        // creates it as ONE shared non-instanced map (see MapManager::CreateMap),
+        // so a bind there is perfectly valid and must not be thrown away.
+        bool globalPvPMap = sWorld.getConfig(CONFIG_BOOL_GLOBAL_PVP_ENABLE) &&
+                            m_homebindMapId == sWorld.getConfig(CONFIG_UINT32_GLOBAL_PVP_MAP);
+
         // accept saved data only for valid position (and non instanceable), and accessable
         if (MapManager::IsValidMapCoord(m_homebindMapId, m_homebindX, m_homebindY, m_homebindZ) &&
-                !bindMapEntry->Instanceable() && GetSession()->Expansion() >= bindMapEntry->Expansion())
+                bindMapEntry && (!bindMapEntry->Instanceable() || globalPvPMap) && GetSession()->Expansion() >= bindMapEntry->Expansion())
         {
             ok = true;
         }
@@ -2225,6 +2255,22 @@ bool Player::_LoadHomeBind(QueryResult* result)
         m_homebindZ = info->positionZ;
 
         CharacterDatabase.PExecute("INSERT INTO `character_homebind` (`guid`,`map`,`zone`,`position_x`,`position_y`,`position_z`) VALUES ('%u', '%u', '%u', '%f', '%f', '%f')", GetGUIDLow(), m_homebindMapId, (uint32)m_homebindAreaId, m_homebindX, m_homebindY, m_homebindZ);
+    }
+
+    // GLOBAL_PVP_PATCH: optionally move every character's hearthstone to the
+    // shared PvP zone (GlobalPvP.SetHomebind = 1), so the hearth always ports
+    // there. Runs once per login and only writes when the bind actually
+    // differs, the normal race hometowns can be restored by disabling the
+    // option (existing binds then survive).
+    if (sWorld.getConfig(CONFIG_BOOL_GLOBAL_PVP_ENABLE) && sWorld.getConfig(CONFIG_BOOL_GLOBAL_PVP_SET_HOMEBIND) &&
+            m_homebindMapId != sWorld.getConfig(CONFIG_UINT32_GLOBAL_PVP_MAP))
+    {
+        WorldLocation pvpLoc;
+        pvpLoc.mapid = sWorld.getConfig(CONFIG_UINT32_GLOBAL_PVP_MAP);
+        pvpLoc.coord_x = sWorld.getConfig(CONFIG_FLOAT_GLOBAL_PVP_X);
+        pvpLoc.coord_y = sWorld.getConfig(CONFIG_FLOAT_GLOBAL_PVP_Y);
+        pvpLoc.coord_z = sWorld.getConfig(CONFIG_FLOAT_GLOBAL_PVP_Z);
+        SetHomebindToLocation(pvpLoc, sWorld.getConfig(CONFIG_UINT32_GLOBAL_PVP_ZONE));
     }
 
     DEBUG_LOG("Setting player home position: mapid is: %u, zoneid is %u, X is %f, Y is %f, Z is %f",

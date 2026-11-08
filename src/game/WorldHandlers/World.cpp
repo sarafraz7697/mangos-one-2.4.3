@@ -241,6 +241,12 @@ World::World()
     {
         m_configBoolValues[i] = false;
     }
+
+    // VIP_PATCH
+    for (int i = 0; i < 11; ++i)
+    {
+        m_vipChatColors[i] = 0;
+    }
 }
 
 /// World destructor

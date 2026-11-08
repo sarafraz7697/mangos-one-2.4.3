@@ -168,7 +168,7 @@ void Player::CheckAreaExploreAndOutdoor()
         else if (p->ExplorationLevel > 0)
         {
             uint32 area = p->ID;
-            if (getLevel() >= sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
+            if (getLevel() >= GetMaxLevel())                // VIP_PATCH: per-account cap
             {
                 SendExplorationExperience(area, 0);
             }
@@ -220,7 +220,19 @@ void Player::UpdateArea(uint32 newArea)
 
     // FFA_PVP flags are area and not zone id dependent
     // so apply them accordingly
-    if (area && (area->Flags & AREA_FLAG_ARENA))
+
+    // GLOBAL_PVP_PATCH: free-for-all in the shared PvP map - everyone (both
+    // factions) can attack everyone while inside, no matter which sub zone
+    // they stand in. UpdateArea runs at login and on every zone/area/map
+    // change, so the flag follows the character in and out of the map.
+    if (sWorld.getConfig(CONFIG_BOOL_GLOBAL_PVP_ENABLE) && GetMapId() == sWorld.getConfig(CONFIG_UINT32_GLOBAL_PVP_MAP))
+    {
+        if (!isGameMaster())
+        {
+            SetFFAPvP(true);
+        }
+    }
+    else if (area && (area->Flags & AREA_FLAG_ARENA))
     {
         if (!isGameMaster())
         {

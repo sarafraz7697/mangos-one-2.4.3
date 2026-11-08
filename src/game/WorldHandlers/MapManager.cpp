@@ -207,6 +207,28 @@ Map* MapManager::CreateMap(uint32 id, const WorldObject* obj)
         return NULL;
     }
 
+    // GLOBAL_PVP_PATCH: the configured free-for-all PvP map is created ONCE as a
+    // shared, non-instanced map (like a continent), no matter what Map.dbc says.
+    // No DungeonMap copies are made and no instance saves are written: every
+    // character that enters lands in the same map and sees everyone else.
+    // (The Map constructor loads the terrain, exactly like the other
+    // non-instanceable maps below.)
+    if (entry->Instanceable() && sWorld.getConfig(CONFIG_BOOL_GLOBAL_PVP_ENABLE) && id == sWorld.getConfig(CONFIG_UINT32_GLOBAL_PVP_MAP))
+    {
+        m = FindMap_unlocked(id);   // m_lock is already held
+        if (m == NULL)
+        {
+            m = new WorldMap(id, i_gridCleanUpDelay);
+            // add map into container
+            i_maps[MapID(id)] = m;
+
+            // non-instanceable maps always expected have saved state
+            m->CreateInstanceData(true);
+        }
+
+        return m;
+    }
+
     if (entry->Instanceable())
     {
         MANGOS_ASSERT(obj && obj->GetTypeId() == TYPEID_PLAYER);

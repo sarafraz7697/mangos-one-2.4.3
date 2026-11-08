@@ -96,7 +96,7 @@ struct LootStoreItem
           group(_group), needs_quest(_chanceOrQuestChance < 0), maxcount(_maxcount), conditionId(_conditionId)
     {}
 
-    bool Roll(bool rate) const;                             // Checks if the entry takes it's chance (at loot generation)
+    bool Roll(bool rate, float chanceBonus = 1.0f) const;   // Checks if the entry takes it's chance (at loot generation)
     bool IsValid(LootStore const& store, uint32 entry) const;
     // Checks correctness of values
 };
@@ -299,8 +299,14 @@ struct Loot
         uint8 unlootedCount;
         LootType loot_type;                                 // required for for proper item loot finish (store internal loot types in different from 3.x version, in fact this meaning that it send same loot types for interesting cases like 3.x version code, skip pre-3.x client loot type limitaitons)
 
-        Loot(WorldObject const* lootTarget, uint32 _gold = 0) : gold(_gold), unlootedCount(0), loot_type(LOOT_CORPSE), m_lootTarget(lootTarget) {}
+        // VIP_PATCH: multiplier applied to every non-grouped drop chance while the
+        // loot is generated (1.0 = no bonus). Set in FillLoot from the loot owner.
+        float chanceBonus;
+
+        Loot(WorldObject const* lootTarget, uint32 _gold = 0) : gold(_gold), unlootedCount(0), loot_type(LOOT_CORPSE), chanceBonus(1.0f), m_lootTarget(lootTarget) {}
         ~Loot() { clear(); }
+
+        float GetChanceBonus() const { return chanceBonus; }
 
         // if loot becomes invalid this reference is used to inform the listener
         void addLootValidatorRef(LootValidatorRef* pLootValidatorRef)

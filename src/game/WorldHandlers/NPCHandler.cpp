@@ -330,6 +330,67 @@ void WorldSession::SendTrainerList(ObjectGuid guid, const std::string& strTitle)
 }
 
 /**
+ * @brief Opens the character's own trainer page without an NPC.
+ *
+ * PERSONAL_TRAINER_PATCH: the "Learn Skill" service of the hearthstone calls
+ * this through the Eluna method Player:SendClassTrainerList(). The page lists
+ * every learnable class spell and the weapon/shield skills of the class,
+ * exactly like a class trainer window - buys are handled in
+ * HandleTrainerBuySpellOpcode with the player itself as the trainer guid.
+ */
+void WorldSession::SendPersonalTrainerList()
+{
+    DEBUG_LOG("WORLD: Sent personal trainer list");
+
+    // remove fake death
+    if (GetPlayer()->hasUnitState(UNIT_STAT_DIED))
+    {
+        GetPlayer()->RemoveSpellsCausingAura(SPELL_AURA_FEIGN_DEATH);
+    }
+
+    _player->BuildPersonalTrainerSpells();
+    _player->m_personalTrainerActive = true;
+
+    std::string strTitle = GetMangosString(LANG_NPC_TAINER_HELLO);
+    strTitle += " - your class trainer";
+
+    uint32 maxcount = _player->m_personalTrainerSpells.size();
+
+    WorldPacket data(SMSG_TRAINER_LIST, 8 + 4 + 4 + maxcount * 38 + strTitle.size() + 1);
+    data << ObjectGuid(_player->GetObjectGuid());           // the trainer is the player
+    data << uint32(TRAINER_TYPE_CLASS);
+
+    size_t count_pos = data.wpos();
+    data << uint32(maxcount);
+
+    uint32 count = 0;
+
+    for (TrainerSpellMap::const_iterator itr = _player->m_personalTrainerSpells.begin(); itr != _player->m_personalTrainerSpells.end(); ++itr)
+    {
+        TrainerSpell const* tSpell = &itr->second;
+
+        uint32 reqLevel = 0;
+        if (!_player->IsSpellFitByClassAndRace(tSpell->spell, &reqLevel))
+        {
+            continue;
+        }
+
+        reqLevel = tSpell->isProvidedReqLevel ? tSpell->reqLevel : std::max(reqLevel, tSpell->reqLevel);
+
+        TrainerSpellState state = _player->GetTrainerSpellState(tSpell, reqLevel);
+
+        SendTrainerSpellHelper(data, tSpell, state, 1.0f, false, reqLevel);
+
+        ++count;
+    }
+
+    data << strTitle;
+
+    data.put<uint32>(count_pos, count);
+    SendPacket(&data);
+}
+
+/**
  * @brief Purchases and casts a trainer spell for the player.
  *
  * @param recv_data The received opcode packet.
@@ -341,6 +402,15 @@ void WorldSession::HandleTrainerBuySpellOpcode(WorldPacket& recv_data)
 
     recv_data >> guid >> spellId;
     DEBUG_LOG("WORLD: Received opcode CMSG_TRAINER_BUY_SPELL Trainer: %s, learn spell id is: %u", guid.GetString().c_str(), spellId);
+
+    // PERSONAL_TRAINER_PATCH: the trainer-less class trainer page opened with
+    // Player:SendClassTrainerList() uses the player itself as the trainer
+    // guid - purchases are validated against the generated personal list.
+    if (_player->IsPersonalTrainerActive() && guid == _player->GetObjectGuid())
+    {
+        _player->LearnPersonalTrainerSpell(spellId);
+        return;
+    }
 
     Creature* unit = GetPlayer()->GetNPCIfCanInteractWith(guid, UNIT_NPC_FLAG_TRAINER);
     if (!unit)
@@ -533,20 +603,27 @@ void WorldSession::HandleGossipSelectOptionOpcode(WorldPacket& recv_data)
             return;
         }
 
+        // Used by Eluna
+        // NOTE: must run *before* the sScriptMgr/SD3 early return below. The SD3
+        // overload of ScriptMgr::OnGossipSelect(Player*, Item*, ...) never routes
+        // into Eluna ("TODO Add Eluna handlers" in ScriptMgrHooks.cpp), so when no
+        // SD3 script is bound to the item it returns false and the old placement of
+        // this block made it unreachable dead code - item gossip selects registered
+        // with RegisterItemGossipEvent(..., GOSSIP_EVENT_ON_SELECT, ...) never fired.
+        // sender/action are read from PlayerTalkClass at the top of this handler,
+        // before Eluna::HandleGossipSelectOption() clears the stored menu.
+#ifdef ENABLE_ELUNA
+        if (Eluna* e = GetPlayer()->GetEluna())
+        {
+            e->HandleGossipSelectOption(GetPlayer(), item, sender, action, code);
+        }
+#endif /* ENABLE_ELUNA */
+
         if (!sScriptMgr.OnGossipSelect(_player, item, sender, action, code.empty() ? NULL : code.c_str()))
         {
             DEBUG_LOG("WORLD: HandleGossipSelectOptionOpcode - item script for %s not found or you can't interact with it.", item->GetProto()->Name1);
             return;
         }
-
-
-        // Used by Eluna
-#ifdef ENABLE_ELUNA
-        if (Eluna* e = GetPlayer()->GetEluna())
-        {
-            e->HandleGossipSelectOption(GetPlayer(), item, GetPlayer()->PlayerTalkClass->GossipOptionSender(gossipListId), GetPlayer()->PlayerTalkClass->GossipOptionAction(gossipListId), code);
-        }
-#endif /* ENABLE_ELUNA */
     }
     else if (guid.IsPlayer())
     {

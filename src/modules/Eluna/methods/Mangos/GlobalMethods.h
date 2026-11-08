@@ -406,6 +406,69 @@ namespace LuaGlobalFunctions
     }
 
     /**
+     * Returns the inventory icon name of an item entry, from the
+     * ItemDisplayInfo.dbc of the server (for example "INV_Sword_39").
+     * Combine with string.format("|TInterface\\Icons\\%s:16:16|t", icon)
+     * to show the icon inside gossip text.
+     *
+     * @param uint32 entry : entry ID of the [Item]
+     * @return string iconName : nil when the item or its display is unknown
+     */
+
+    /**
+     * Returns the settings of the shared free-for-all PvP map
+     * (GLOBAL_PVP_PATCH, GlobalPvP.* in mangosd.conf).
+     *
+     * Returns eight values:
+     *   enabled, map, zone, area, x, y, z, orientation
+     *
+     * @return bool enabled : whether the map is active
+     * @return uint32 map / zone / area
+     * @return float x / y / z / orientation : landing position
+     */
+    int GetGlobalPvPInfo(Eluna* E)
+    {
+        bool enabled = sWorld.getConfig(CONFIG_BOOL_GLOBAL_PVP_ENABLE);
+        E->Push(enabled);
+        E->Push(sWorld.getConfig(CONFIG_UINT32_GLOBAL_PVP_MAP));
+        E->Push(sWorld.getConfig(CONFIG_UINT32_GLOBAL_PVP_ZONE));
+        E->Push(sWorld.getConfig(CONFIG_UINT32_GLOBAL_PVP_AREA));
+        E->Push(sWorld.getConfig(CONFIG_FLOAT_GLOBAL_PVP_X));
+        E->Push(sWorld.getConfig(CONFIG_FLOAT_GLOBAL_PVP_Y));
+        E->Push(sWorld.getConfig(CONFIG_FLOAT_GLOBAL_PVP_Z));
+        E->Push(sWorld.getConfig(CONFIG_FLOAT_GLOBAL_PVP_O));
+        return 8;
+    }
+
+    int GetItemIcon(Eluna* E)
+    {
+        uint32 entry = E->CHECKVAL<uint32>(1);
+        ItemPrototype const* proto = eObjectMgr->GetItemPrototype(entry);
+        if (!proto)
+            return luaL_argerror(E->L, 1, "valid ItemEntry expected");
+
+        ItemDisplayInfoEntry const* display = GetItemDisplayInfo(proto->DisplayInfoID);
+        if (!display)
+        {
+            E->Push();
+            return 1;
+        }
+
+        char const* icon = display->InventoryIcon[0];
+        if (!icon || !*icon)
+            icon = display->InventoryIcon[1];
+
+        if (!icon || !*icon)
+        {
+            E->Push();
+            return 1;
+        }
+
+        E->Push(icon);
+        return 1;
+    }
+
+    /**
      * Returns the type ID from a GUID.
      *
      * Type ID is different for each type ([Player], [Creature], [GameObject], etc.).
@@ -679,6 +742,7 @@ namespace LuaGlobalFunctions
      *     PLAYER_EVENT_ON_COMMAND                 =     42,       // (event, player, command) - player is nil if command used from console. Can return false
      *     PLAYER_EVENT_ON_BUY_ITEM                =     55,       // (event, player, vendor, itemEntry, count) - vendor is nil for the fake inventory. Return false or a BuyResult number (0, 1, 2, 4, 5, 7, 8, 11, 12) to refuse the purchase
      *     PLAYER_EVENT_ON_ITEM_MORPH              =     56,       // (event, player, slot, itemEntry, displayIdOrItemId) - return false to deny the item visual change
+     *     PLAYER_EVENT_ON_BUY_ITEM_COMPLETE     =     57,       // (event, player, vendor, item, count) - vendor is nil for the fake inventory. Fires after a purchase fully succeeded (item stored, money taken)
      * };
      * </pre>
      *
@@ -3119,6 +3183,8 @@ namespace LuaGlobalFunctions
         { "bit_or", &LuaGlobalFunctions::bit_or },
         { "bit_and", &LuaGlobalFunctions::bit_and },
         { "GetItemLink", &LuaGlobalFunctions::GetItemLink },
+        { "GetItemIcon", &LuaGlobalFunctions::GetItemIcon },
+        { "GetGlobalPvPInfo", &LuaGlobalFunctions::GetGlobalPvPInfo },   // GLOBAL_PVP_PATCH
         { "GetMapById", &LuaGlobalFunctions::GetMapById },
         { "GetCurrTime", &LuaGlobalFunctions::GetCurrTime },
         { "GetTimeDiff", &LuaGlobalFunctions::GetTimeDiff },

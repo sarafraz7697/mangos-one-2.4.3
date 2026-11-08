@@ -170,6 +170,26 @@ bool HonorMgr::Reward(Unit* uVictim, uint32 groupsize, float honor)
             m_owner->ApplyModUInt32Value(PLAYER_FIELD_KILLS, 1, true);
             // and those in a lifetime
             m_owner->ApplyModUInt32Value(PLAYER_FIELD_LIFETIME_HONORABLE_KILLS, 1, true);
+
+            // MAGIC_GOLD_PATCH: killing another character awards Magic Gold.
+            // The victim passed the gray-level check above, so low-level farming
+            // earns nothing; group kills award every credited killer.
+            if (sWorld.getConfig(CONFIG_BOOL_MAGIC_GOLD_ENABLE))
+            {
+                float mg = sWorld.getConfig(CONFIG_FLOAT_MAGIC_GOLD_PVPKILL_BASE)
+                         + sWorld.getConfig(CONFIG_FLOAT_MAGIC_GOLD_PVPKILL_PER_VICTIM_LEVEL) * v_level;
+
+                // VIP_PATCH: higher VIP ranks earn more Magic Gold
+                if (uint8 vip = m_owner->GetEffectiveVIPLevel())
+                {
+                    mg *= (1.0f + vip * sWorld.getConfig(CONFIG_FLOAT_VIP_MG_RATE_PER_LEVEL));
+                }
+
+                if (mg >= 1.0f)
+                {
+                    m_owner->ModifyMagicGold(int32(mg), true);
+                }
+            }
         }
         else
         {
@@ -188,6 +208,12 @@ bool HonorMgr::Reward(Unit* uVictim, uint32 groupsize, float honor)
     if (uVictim != NULL)
     {
         honor *= sWorld.getConfig(CONFIG_FLOAT_RATE_HONOR);
+
+        // VIP_PATCH: bonus honor per VIP level
+        if (uint8 vip = m_owner->GetEffectiveVIPLevel())
+        {
+            honor *= (1.0f + vip * sWorld.getConfig(CONFIG_FLOAT_VIP_HONOR_RATE_PER_LEVEL));
+        }
 
         if (groupsize > 1)
         {

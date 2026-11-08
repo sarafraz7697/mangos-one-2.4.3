@@ -153,7 +153,15 @@ int32 Player::CalculateReputationGain(ReputationSource source, int32 rep, int32 
         percent *= repRate;
     }
 
-    return int32(sWorld.getConfig(CONFIG_FLOAT_RATE_REPUTATION_GAIN) * rep * percent / 100.0f);
+    // VIP_PATCH: bonus reputation per VIP level, on top of every other rate
+    float vipRate = 1.0f;
+
+    if (uint8 vip = GetEffectiveVIPLevel())
+    {
+        vipRate = 1.0f + vip * sWorld.getConfig(CONFIG_FLOAT_VIP_REPUTATION_RATE_PER_LEVEL);
+    }
+
+    return int32(vipRate * sWorld.getConfig(CONFIG_FLOAT_RATE_REPUTATION_GAIN) * rep * percent / 100.0f);
 }
 
 // Calculates how many reputation points player gains in victim's enemy factions

@@ -416,6 +416,7 @@ class WorldSession
 
         void SendTrainerList(ObjectGuid guid);
         void SendTrainerList(ObjectGuid guid, const std::string& strTitle);
+        void SendPersonalTrainerList();                          // PERSONAL_TRAINER_PATCH: the character's own trainer page (no NPC)
 
         void SendListInventory(ObjectGuid guid);
         bool CheckBanker(ObjectGuid guid);

@@ -82,8 +82,15 @@ void WorldSession::HandleSellItemOpcode(WorldPacket& recv_data)
         return;
     }
 
-    Creature* pCreature = GetPlayer()->GetNPCIfCanInteractWith(vendorGuid, UNIT_NPC_FLAG_VENDOR);
-    if (!pCreature)
+    // FAKE_INVENTORY_PATCH: the pocket vendor window accepts sells too (Gear Sale)
+    Creature* pCreature = NULL;
+
+    if (!GetPlayer()->IsVirtualVendor(vendorGuid))
+    {
+        pCreature = GetPlayer()->GetNPCIfCanInteractWith(vendorGuid, UNIT_NPC_FLAG_VENDOR);
+    }
+
+    if (!pCreature && !GetPlayer()->IsVirtualVendor(vendorGuid))
     {
         DEBUG_LOG("WORLD: HandleSellItemOpcode - %s not found or you can't interact with him.", vendorGuid.GetString().c_str());
         _player->SendSellError(SELL_ERR_CANT_FIND_VENDOR, NULL, itemGuid, 0);

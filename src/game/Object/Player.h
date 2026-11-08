@@ -919,6 +919,10 @@ enum PlayerLoginQueryIndex
     PLAYER_LOGIN_QUERY_LOADSKILLS,
     PLAYER_LOGIN_QUERY_LOADMAILS,
     PLAYER_LOGIN_QUERY_LOADMAILEDITEMS,
+    // MAGIC_GOLD_PATCH / TIMED_ITEM_PATCH
+    PLAYER_LOGIN_QUERY_LOADMAGICGOLD,
+    PLAYER_LOGIN_QUERY_LOADITEMMORPHS,
+    PLAYER_LOGIN_QUERY_LOADITEMEXPIRY,
 
     MAX_PLAYER_LOGIN_QUERY
 };
@@ -1858,13 +1862,24 @@ class Player : public Unit
         VendorItemData m_virtualVendorItems;
         std::map<uint32, uint32> m_virtualVendorPrices;    // item -> price in copper (per BuyCount bundle)
 
+        // PERSONAL_TRAINER_PATCH: the character's own trainer page (opened from
+        // the hearthstone "Learn Skill" service, no NPC involved). The list is
+        // generated from the DBC data of the player's class - every class spell
+        // up to the current expansion plus the weapon/shield skills the class
+        // may learn - and purchases are validated against it.
+        bool IsPersonalTrainerActive() const { return m_personalTrainerActive; }
+        void BuildPersonalTrainerSpells();                  // (re)fill m_personalTrainerSpells
+        bool LearnPersonalTrainerSpell(uint32 spellId);     // buy from the personal trainer
+        bool m_personalTrainerActive;
+        TrainerSpellMap m_personalTrainerSpells;            // spell id -> TrainerSpell
+
         // ITEM_VISUAL_PATCH: temporary equipped item display overrides (like transmogrification).
         // The override is session only: it is never saved and disappears on logout/login.
         // An override stores an item ENTRY because the client renders player gear from the
         // item entry in the visible item fields: the entry of the wanted item, of an item
         // that uses the wanted display, or a synthetic entry for a display no item uses.
-        bool SetItemVisualOverride(uint8 slot, uint32 displayId);                   // display id or item entry, 0 = restore the real look
-        bool SetItemVisualOverrideByItemEntry(uint32 itemEntry, uint32 displayId);  // display id or item entry, first equipment slot with this item
+        bool SetItemVisualOverride(uint8 slot, uint32 displayId, uint32 expireSeconds = 0, bool persist = false);  // display id or item entry, 0 = restore the real look
+        bool SetItemVisualOverrideByItemEntry(uint32 itemEntry, uint32 displayId, uint32 expireSeconds = 0, bool persist = false); // display id or item entry, first equipment slot with this item
         void ResetItemVisualOverrides();                                            // restore every slot
 
         // The override item entry of a visible slot, 0 when the slot is not overridden.
@@ -1875,6 +1890,43 @@ class Player : public Unit
         }
 
         uint32 m_itemVisualOverrideEntries[EQUIPMENT_SLOT_END];    // fake item entry per equipment slot, 0 = not overridden
+        uint32 m_itemVisualOverrideSlotItems[EQUIPMENT_SLOT_END];  // guid low of the item the slot override belongs to (per-item morphs, not per-slot)
+
+        // ITEM_VISUAL_PERSIST_PATCH: saved item looks (character_item_morph table).
+        // Keyed by item guid: the bought look follows the item, not the slot, and
+        // survives relogging. expireTime 0 = no expiry. Applied in SetVisibleItemSlot
+        // whenever the item is (re)equipped, so login and re-equip both work.
+        struct ItemMorphRecord { uint32 displayId; time_t expireTime; };
+        std::map<uint32, ItemMorphRecord> m_itemMorphRecords;       // item guid low -> morph
+        void _LoadItemMorphs(QueryResult* result);
+        uint32 GetShownItemEntryForSlot(uint8 slot) const;           // entry shown on a slot, morph look included (character list)
+
+        // TIMED_ITEM_PATCH: rented items that are destroyed when they expire
+        // (character_item_expiry table). Keyed by item guid low.
+        std::map<uint32, time_t> m_itemExpiries;                    // item guid low -> expire time
+        void _LoadItemExpiries(QueryResult* result);
+        void SetItemExpiry(Item* item, uint32 seconds);              // 0 seconds = no expiry
+        uint32 GetItemExpiryRemaining(Item* item) const;             // seconds left, 0 = none
+        void UpdateTimedItems();                                    // periodic expiry sweep
+
+        // MAGIC_GOLD_PATCH: Magic Gold, a second per-character currency for scripts.
+        // Earned by killing other characters, spent through Eluna.
+        uint32 GetMagicGold() const { return m_magicGold; }
+        bool ModifyMagicGold(int32 amount, bool announce = false);  // false when a deduction is not covered
+        void SetMagicGold(uint32 value) { m_magicGold = value; }
+        void _LoadMagicGold(QueryResult* result);
+        uint32 m_magicGold;
+
+        // VIP_PATCH: account-wide VIP level (realmd table account_vip, read at login).
+        uint8 GetVIPLevel() const { return m_vipLevel; }
+        uint8 GetEffectiveVIPLevel() const;                         // clamped by VIP.MaxLevel
+        void SetVIPLevel(uint8 level, bool writeToDb = true);       // live change, also updates account_vip
+        uint32 GetMaxLevel() const;                                 // world cap + effective VIP level
+        std::string GetVIPChatName() const;                         // chat name colored by VIP level
+        uint8 m_vipLevel;
+
+        // TIMED_ITEM_PATCH: countdown (msecs) to the next expiry sweep
+        uint32 m_timedItemsTimer;
 
         // Buy an item from a vendor
         bool BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, uint8 bag, uint8 slot);

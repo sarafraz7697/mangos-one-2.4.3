@@ -323,7 +323,22 @@ bool Unit::IsVisibleForOrDetect(Unit const* u, WorldObject const* viewPoint, boo
         //-Stealth Mod(positive like Master of Deception) and Stealth Detection(negative like paranoia)
         // based on wowwiki every 5 mod we have 1 more level diff in calculation
         visibleDistance += (int32(u->GetTotalAuraModifier(SPELL_AURA_MOD_STEALTH_DETECT)) - stealthMod) / 5.0f;
-        visibleDistance = visibleDistance > MAX_PLAYER_STEALTH_DETECT_RANGE ? MAX_PLAYER_STEALTH_DETECT_RANGE : visibleDistance;
+
+        // VIP_PATCH: high VIP ranks spot stealthed characters from further away.
+        // The cap grows by the same bonus so the bonus stays effective.
+        float vipDetectBonus = 0.0f;
+
+        if (u->GetTypeId() == TYPEID_PLAYER)
+        {
+            if (uint8 vip = ((Player const*)u)->GetEffectiveVIPLevel())
+            {
+                vipDetectBonus = vip * sWorld.getConfig(CONFIG_FLOAT_VIP_STEALTH_DETECT_PER_LEVEL);
+                visibleDistance += vipDetectBonus;
+            }
+        }
+
+        float detectRangeCap = MAX_PLAYER_STEALTH_DETECT_RANGE + vipDetectBonus;
+        visibleDistance = visibleDistance > detectRangeCap ? detectRangeCap : visibleDistance;
 
         // recheck new distance
         if (visibleDistance <= 0 || !Where().WithinDist(viewPoint->Where(), visibleDistance))

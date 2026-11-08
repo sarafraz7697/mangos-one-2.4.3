@@ -753,6 +753,47 @@ namespace LuaItem
      * @param uint32 enchantSlot : the slot for the enchant to be applied to
      * @return bool enchantmentSuccess : if enchantment is successfully set to specified slot, returns 'true', otherwise 'false'
      */
+    /**
+     * Puts the [Item] on a rental timer: the core destroys it when the time
+     * is over (also while offline at the next login). TIMED_ITEM_PATCH
+     *
+     * @param uint32 seconds : lifetime in seconds, 0 removes the timer
+     */
+    int SetItemExpiry(Eluna* E, Item* item)
+    {
+        uint32 seconds = E->CHECKVAL<uint32>(2);
+
+        Player* owner = item->GetOwner();
+        if (!owner)
+        {
+            E->Push(false);
+            return 1;
+        }
+
+        owner->SetItemExpiry(item, seconds);
+        E->Push(true);
+        return 1;
+    }
+
+    /**
+     * Returns the seconds until the [Item] expires, 0 when it has no
+     * rental timer. TIMED_ITEM_PATCH
+     *
+     * @return uint32 secondsLeft
+     */
+    int GetItemExpiry(Eluna* E, Item* item)
+    {
+        Player* owner = item->GetOwner();
+        if (!owner)
+        {
+            E->Push(uint32(0));
+            return 1;
+        }
+
+        E->Push(owner->GetItemExpiryRemaining(item));
+        return 1;
+    }
+
     int SetEnchantment(Eluna* E, Item* item)
     {
         Player* owner = item->GetOwner();
@@ -917,6 +958,8 @@ namespace LuaItem
 
         // Other
         { "SaveToDB", &LuaItem::SaveToDB },
+        { "SetItemExpiry", &LuaItem::SetItemExpiry },   // TIMED_ITEM_PATCH
+        { "GetItemExpiry", &LuaItem::GetItemExpiry },
 
         // Not implemented methods
         { "IsRefundExpired", METHOD_REG_NONE }, // not implemented

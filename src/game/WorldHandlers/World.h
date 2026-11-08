@@ -230,6 +230,17 @@ enum eConfigUInt32Values
     CONFIG_UINT32_CINEMATIC_FLYOVER_BODY_ENTRY,
     /// 0 off, 1 report, 2 refuse to start. See World::VerifyDataIntegrity.
     CONFIG_UINT32_DATA_INTEGRITY_CHECK,
+    // MAGIC_GOLD_PATCH
+    CONFIG_UINT32_MAGIC_GOLD_MAX,
+    // VIP_PATCH
+    CONFIG_UINT32_VIP_MAX_LEVEL,
+    // TIMED_ITEM_PATCH: seconds between expiry sweeps for timed items / timed morphs
+    CONFIG_UINT32_TIMED_ITEM_CHECK_INTERVAL,
+    // GLOBAL_PVP_PATCH: the shared free-for-all PvP map (see GlobalPvP.* in mangosd.conf)
+    CONFIG_UINT32_GLOBAL_PVP_MAP,
+    // GLOBAL_PVP_PATCH: zone / area ids of the PvP spot, used for the homebind entry
+    CONFIG_UINT32_GLOBAL_PVP_ZONE,
+    CONFIG_UINT32_GLOBAL_PVP_AREA,
     CONFIG_UINT32_VALUE_COUNT
 };
 
@@ -328,6 +339,21 @@ enum eConfigFloatValues
     CONFIG_FLOAT_RATE_DAMAGE_RANGED,
     CONFIG_FLOAT_RATE_DAMAGE_SPELL,
     CONFIG_FLOAT_RATE_HEALING,
+    // MAGIC_GOLD_PATCH: Magic Gold currency (earned by killing other characters)
+    CONFIG_FLOAT_MAGIC_GOLD_PVPKILL_BASE,
+    CONFIG_FLOAT_MAGIC_GOLD_PVPKILL_PER_VICTIM_LEVEL,
+    // VIP_PATCH: per-VIP-level bonuses
+    CONFIG_FLOAT_VIP_LOOT_CHANCE_PER_LEVEL,
+    CONFIG_FLOAT_VIP_STEALTH_DETECT_PER_LEVEL,
+    CONFIG_FLOAT_VIP_MG_RATE_PER_LEVEL,
+    CONFIG_FLOAT_VIP_XP_RATE_PER_LEVEL,
+    CONFIG_FLOAT_VIP_HONOR_RATE_PER_LEVEL,
+    CONFIG_FLOAT_VIP_REPUTATION_RATE_PER_LEVEL,
+    // GLOBAL_PVP_PATCH: landing position inside the shared PvP map
+    CONFIG_FLOAT_GLOBAL_PVP_X,
+    CONFIG_FLOAT_GLOBAL_PVP_Y,
+    CONFIG_FLOAT_GLOBAL_PVP_Z,
+    CONFIG_FLOAT_GLOBAL_PVP_O,
     CONFIG_FLOAT_VALUE_COUNT
 };
 
@@ -423,6 +449,14 @@ enum eConfigBoolValues
     CONFIG_BOOL_WARDEN_REQUIRE_EXACT_PROFILE,
     CONFIG_BOOL_CREATURE_HEALTH_AS_PERCENT,
     CONFIG_BOOL_ITEM_VISUAL_OVERRIDE_ENABLE,
+    // MAGIC_GOLD_PATCH
+    CONFIG_BOOL_MAGIC_GOLD_ENABLE,
+    // VIP_PATCH: colorize player names in chat channels by VIP level
+    CONFIG_BOOL_VIP_CHAT_COLOR_ENABLE,
+    // GLOBAL_PVP_PATCH: master switch of the shared free-for-all PvP map
+    CONFIG_BOOL_GLOBAL_PVP_ENABLE,
+    // GLOBAL_PVP_PATCH: move every character's hearthstone to the PvP spot at login
+    CONFIG_BOOL_GLOBAL_PVP_SET_HOMEBIND,
     CONFIG_BOOL_VALUE_COUNT
 };
 
@@ -606,6 +640,12 @@ class World
         {
             uint32 lvl = getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
             return lvl > 60 ? 300 + ((lvl - 60) * 75) / 10 : lvl * 5;
+        }
+
+        // VIP_PATCH: chat name color of a VIP level (0xRRGGBB), 0 = use the default color
+        uint32 GetVIPChatColor(uint8 level) const
+        {
+            return (level > 0 && level <= 10) ? m_vipChatColors[level] : 0;
         }
 
         void SetInitialWorldSettings();
@@ -892,6 +932,9 @@ class World
         int32 m_configInt32Values[CONFIG_INT32_VALUE_COUNT];
         float m_configFloatValues[CONFIG_FLOAT_VALUE_COUNT];
         bool m_configBoolValues[CONFIG_BOOL_VALUE_COUNT];
+
+        // VIP_PATCH: chat name colors per VIP level as 0xRRGGBB (index 1..10, 0 = default color)
+        uint32 m_vipChatColors[11];
 
         int32 m_playerLimit;
         LocaleConstant m_defaultDbcLocale;                  // from config for one from loaded DBC locales

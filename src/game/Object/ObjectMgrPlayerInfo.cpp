@@ -719,8 +719,19 @@ void ObjectMgr::LoadPlayerInfo()
 
     // Loading xp per level data
     {
-        mPlayerXPperLevel.resize(sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL));
-        for (uint32 level = 0; level < sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL); ++level)
+        // VIP_PATCH: the xp table also covers the levels above MaxPlayerLevel that
+        // VIP accounts can reach (world cap + VIP.MaxLevel). Missing rows there are
+        // extrapolated from the curve instead of relying on the world DB.
+        uint32 configMax = sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
+        uint32 extendedMax = configMax + sWorld.getConfig(CONFIG_UINT32_VIP_MAX_LEVEL);
+
+        if (extendedMax > MAX_LEVEL)
+        {
+            extendedMax = MAX_LEVEL;
+        }
+
+        mPlayerXPperLevel.resize(extendedMax);
+        for (uint32 level = 0; level < extendedMax; ++level)
         {
             mPlayerXPperLevel[level] = 0;
         }
@@ -750,7 +761,7 @@ void ObjectMgr::LoadPlayerInfo()
             uint32 current_level = fields[0].GetUInt32();
             uint32 current_xp    = fields[1].GetUInt32();
 
-            if (current_level >= sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
+            if (current_level >= extendedMax)
             {
                 if (current_level > STRONG_MAX_LEVEL)       // hardcoded level maximum
                 {
@@ -777,12 +788,40 @@ void ObjectMgr::LoadPlayerInfo()
     }
 
     // fill level gaps
-    for (uint32 level = 1; level < sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL); ++level)
     {
-        if (mPlayerXPperLevel[level] == 0)
+        uint32 configMax = sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL);
+        uint32 extendedMax = configMax + sWorld.getConfig(CONFIG_UINT32_VIP_MAX_LEVEL);
+
+        if (extendedMax > MAX_LEVEL)
         {
-            sLog.outErrorDb("Level %i does not have XP for level data. Using data of level [%i] + 100.", level + 1, level);
-            mPlayerXPperLevel[level] = mPlayerXPperLevel[level - 1] + 100;
+            extendedMax = MAX_LEVEL;
+        }
+
+        for (uint32 level = 1; level < extendedMax; ++level)
+        {
+            if (mPlayerXPperLevel[level] == 0)
+            {
+                if (level < configMax)
+                {
+                    sLog.outErrorDb("Level %i does not have XP for level data. Using data of level [%i] + 100.", level + 1, level);
+                    mPlayerXPperLevel[level] = mPlayerXPperLevel[level - 1] + 100;
+                }
+                else
+                {
+                    // VIP_PATCH: continue the curve beyond the world cap so VIP
+                    // levels need a sensible amount of xp, not a flat +100
+                    uint32 prev = mPlayerXPperLevel[level - 1];
+                    uint32 prevPrev = level >= 2 ? mPlayerXPperLevel[level - 2] : prev - 100;
+                    uint32 step = prev > prevPrev ? prev - prevPrev : 100;
+
+                    if (step < 100)
+                    {
+                        step = 100;
+                    }
+
+                    mPlayerXPperLevel[level] = prev + step;
+                }
+            }
         }
     }
 }

@@ -393,10 +393,17 @@ Player::Player(WorldSession* session): Unit(), m_petMgr(this), m_honorMgr(this),
 {
     m_virtualVendorActive = false; // FAKE_INVENTORY_PATCH
     m_virtualVendorReadOnly = false;
+    m_personalTrainerActive = false; // PERSONAL_TRAINER_PATCH
     for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot) // ITEM_VISUAL_PATCH
     {
         m_itemVisualOverrideEntries[slot] = 0;
+        m_itemVisualOverrideSlotItems[slot] = 0;
     }
+    m_itemMorphRecords.clear();       // ITEM_VISUAL_PERSIST_PATCH
+    m_itemExpiries.clear();           // TIMED_ITEM_PATCH
+    m_magicGold = 0;                  // MAGIC_GOLD_PATCH
+    m_vipLevel = 0;                   // VIP_PATCH
+    m_timedItemsTimer = 3000;         // TIMED_ITEM_PATCH: first sweep shortly after login
 #ifdef ENABLE_PLAYERBOTS
     m_playerbotAI = 0;
     m_playerbotMgr = 0;
@@ -635,6 +642,7 @@ Player::Player(WorldSession* session): Unit(), m_petMgr(this), m_honorMgr(this),
 Player::~Player()
 {
     m_virtualVendorItems.Clear(); // FAKE_INVENTORY_PATCH
+    m_personalTrainerActive = false; // PERSONAL_TRAINER_PATCH
     // Perform cleanup before deleting the player object
     CleanupsBeforeDelete();
 
@@ -1118,6 +1126,18 @@ void Player::Update(uint32 update_diff, uint32 p_time)
     if (m_cinematicFlyover && m_cinematicFlyover->IsActive())
     {
         m_cinematicFlyover->Update(update_diff);
+    }
+
+    // TIMED_ITEM_PATCH: periodic sweep that destroys rented items whose time is
+    // over and restores item looks whose morph time is over.
+    if (m_timedItemsTimer <= update_diff)
+    {
+        m_timedItemsTimer = sWorld.getConfig(CONFIG_UINT32_TIMED_ITEM_CHECK_INTERVAL) * 1000;
+        UpdateTimedItems();
+    }
+    else
+    {
+        m_timedItemsTimer -= update_diff;
     }
 
     // Update player-only attacks
@@ -2434,9 +2454,15 @@ void Player::GiveXP(uint32 xp, Unit* victim)
 #endif /* ENABLE_ELUNA */
 
     // XP to money conversion processed in Player::RewardQuest
-    if (level >= sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
+    if (level >= GetMaxLevel())                             // VIP_PATCH: per-account cap (world cap + VIP levels)
     {
         return;
+    }
+
+    // VIP_PATCH: bonus experience per VIP level, on top of all other rates
+    if (uint8 vip = GetEffectiveVIPLevel())
+    {
+        xp = uint32(xp * (1.0f + vip * sWorld.getConfig(CONFIG_FLOAT_VIP_XP_RATE_PER_LEVEL)));
     }
 
     // handle SPELL_AURA_MOD_XP_PCT auras
@@ -2455,11 +2481,11 @@ void Player::GiveXP(uint32 xp, Unit* victim)
     uint32 nextLvlXP = GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
     uint32 newXP = curXP + xp + rested_bonus_xp;
 
-    while (newXP >= nextLvlXP && level < sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
+    while (newXP >= nextLvlXP && level < GetMaxLevel())    // VIP_PATCH: per-account cap
     {
         newXP -= nextLvlXP;
 
-        if (level < sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
+        if (level < GetMaxLevel())                         // VIP_PATCH: per-account cap
         {
             GiveLevel(level + 1);
         }
@@ -2657,7 +2683,7 @@ void Player::InitStatsForLevel(bool reapplyMods)
     PlayerLevelInfo info;
     sObjectMgr.GetPlayerLevelInfo(getRace(), getClass(), getLevel(), &info);
 
-    SetUInt32Value(PLAYER_FIELD_MAX_LEVEL, sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL));
+    SetUInt32Value(PLAYER_FIELD_MAX_LEVEL, GetMaxLevel());  // VIP_PATCH: per-account cap (world cap + VIP levels)
     SetUInt32Value(PLAYER_NEXT_LEVEL_XP, sObjectMgr.GetXPForLevel(getLevel()));
 
     // reset before any aura state sources (health set/aura apply)
@@ -4769,6 +4795,15 @@ bool Player::BuyItemFromVendor(ObjectGuid vendorGuid, uint32 item, uint8 count, 
     GetSession()->SendPacket(&data);
 
     SendNewItem(pItem, totalCount, true, false, false);
+
+    // Used by Eluna: a Lua handler of PLAYER_EVENT_ON_BUY_ITEM_COMPLETE can react to
+    // the finished purchase (deduct Magic Gold, attach a rental time to the item)
+#ifdef ENABLE_ELUNA
+    if (Eluna* e = GetEluna())
+    {
+        e->OnBuyItemComplete(this, pCreature, pItem, count);
+    }
+#endif /* ENABLE_ELUNA */
 
     return pCreature && crItem->maxcount != 0;
 }

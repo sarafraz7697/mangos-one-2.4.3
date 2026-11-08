@@ -160,6 +160,10 @@ bool LoginQueryHolder::Initialize()
     res &= SetPQuery(PLAYER_LOGIN_QUERY_LOADSKILLS,          "SELECT `skill`, `value`, `max` FROM `character_skills` WHERE `guid` = '%u'", m_guid.GetCounter());
     res &= SetPQuery(PLAYER_LOGIN_QUERY_LOADMAILS,           "SELECT `id`,`messageType`,`sender`,`receiver`,`subject`,`body`,`expire_time`,`deliver_time`,`money`,`cod`,`checked`,`stationery`,`mailTemplateId`,`has_items` FROM `mail` WHERE `receiver` = '%u' ORDER BY `id` DESC", m_guid.GetCounter());
     res &= SetPQuery(PLAYER_LOGIN_QUERY_LOADMAILEDITEMS,     "SELECT `data`, `mail_id`, `item_guid`, `item_template` FROM `mail_items` JOIN `item_instance` ON `item_guid` = `guid` WHERE `receiver` = '%u'", m_guid.GetCounter());
+    // MAGIC_GOLD_PATCH / TIMED_ITEM_PATCH / ITEM_VISUAL_PERSIST_PATCH
+    res &= SetPQuery(PLAYER_LOGIN_QUERY_LOADMAGICGOLD,       "SELECT `mg` FROM `character_magic_gold` WHERE `guid` = '%u'", m_guid.GetCounter());
+    res &= SetPQuery(PLAYER_LOGIN_QUERY_LOADITEMMORPHS,      "SELECT `item_guid`, `display_id`, `expire_time` FROM `character_item_morph` WHERE `player_guid` = '%u'", m_guid.GetCounter());
+    res &= SetPQuery(PLAYER_LOGIN_QUERY_LOADITEMEXPIRY,      "SELECT `item_guid`, `expire_time` FROM `character_item_expiry` WHERE `player_guid` = '%u'", m_guid.GetCounter());
 
     return res;
 }

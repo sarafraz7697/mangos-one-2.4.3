@@ -2191,28 +2191,60 @@ namespace LuaPlayer
 
     /**
      * Morphs the visible look of the first equipped [Item] with the given entry.
-     * ITEM_VISUAL_PATCH: temporary transmogrification-like display override.
+     * ITEM_VISUAL_PATCH: transmogrification-like display override.
      *
-     * The change is visible to everyone immediately (like .morph). It is session
-     * only: nothing is saved and it disappears on logout/login. Stats, enchants,
+     * The change is visible to everyone immediately (like .morph). Stats, enchants,
      * tooltips and inspection keep using the real item.
+     *
+     * With persist = true the look is saved in the character database and survives
+     * relogging (it follows the item, see also the VIP morph service), optionally
+     * with an expiry in seconds after which the real look comes back.
      *
      * @param uint32 itemId : equipped item entry to change
      * @param uint32 displayId : display id (ItemDisplayInfo.dbc - raw ids such as creature_equip_template_raw.equipmodel values work) or an item entry (e.g. a creature_equip_template.equipentry value), 0 restores the real look
+     * @param uint32 expireSeconds = 0 : seconds the look stays when persist is set (0 = no expiry)
+     * @param bool persist = false : true = save the look so it survives relogging
      * @return bool applied
      */
+
+    /**
+     * Buys an item from the player's own fake inventory window, as if the player
+     * had clicked it there (FAKE_INVENTORY_PATCH). Triggers the normal purchase
+     * path including the PLAYER_EVENT_ON_BUY_ITEM / ON_BUY_ITEM_COMPLETE hooks,
+     * so scripts can use it to finish a purchase they confirmed in a gossip
+     * dialog (the hook can distinguish it with its own "confirmed" state).
+     *
+     * @param uint32 itemEntry : the item to buy from the open window
+     * @param uint8 count = 1 : stack count
+     */
+    int BuyInventoryMenuItem(Eluna* E, Player* player)
+    {
+        uint32 item = E->CHECKVAL<uint32>(2);
+        uint8 count = E->CHECKVAL<uint8>(3, 1);
+
+        if (count < 1)
+        {
+            count = 1;
+        }
+
+        player->BuyItemFromVendor(player->GetObjectGuid(), item, count, NULL_BAG, NULL_SLOT);
+        return 0;
+    }
+
     int ItemMorph(Eluna* E, Player* player)
     {
         uint32 itemEntry = E->CHECKVAL<uint32>(2);
         uint32 displayId = E->CHECKVAL<uint32>(3);
+        uint32 expireSeconds = E->CHECKVAL<uint32>(4, 0);
+        bool persist = E->CHECKVAL<bool>(5, false);
 
-        E->Push(player->SetItemVisualOverrideByItemEntry(itemEntry, displayId));
+        E->Push(player->SetItemVisualOverrideByItemEntry(itemEntry, displayId, expireSeconds, persist));
         return 1;
     }
 
     /**
      * Morphs the visible look of the [Item] in the given equipment slot.
-     * ITEM_VISUAL_PATCH: temporary transmogrification-like display override.
+     * ITEM_VISUAL_PATCH: transmogrification-like display override.
      *
      * Slots: 0 head, 1 neck, 2 shoulders, 3 body(shirt), 4 chest, 5 waist,
      * 6 legs, 7 feet, 8 wrists, 9 hands, 10 finger1, 11 finger2, 12 trinket1,
@@ -2220,14 +2252,18 @@ namespace LuaPlayer
      *
      * @param uint8 slot : equipment slot
      * @param uint32 displayId : display id (ItemDisplayInfo.dbc - raw ids such as creature_equip_template_raw.equipmodel values work) or an item entry (e.g. a creature_equip_template.equipentry value), 0 restores the real look
+     * @param uint32 expireSeconds = 0 : seconds the look stays when persist is set (0 = no expiry)
+     * @param bool persist = false : true = save the look so it survives relogging
      * @return bool applied
      */
     int ItemMorphSlot(Eluna* E, Player* player)
     {
         uint8 slot = E->CHECKVAL<uint8>(2);
         uint32 displayId = E->CHECKVAL<uint32>(3);
+        uint32 expireSeconds = E->CHECKVAL<uint32>(4, 0);
+        bool persist = E->CHECKVAL<bool>(5, false);
 
-        E->Push(player->SetItemVisualOverride(slot, displayId));
+        E->Push(player->SetItemVisualOverride(slot, displayId, expireSeconds, persist));
         return 1;
     }
 
@@ -2238,6 +2274,75 @@ namespace LuaPlayer
     int ItemMorphReset(Eluna* E, Player* player)
     {
         player->ResetItemVisualOverrides();
+        return 0;
+    }
+
+    /**
+     * Returns the Magic Gold balance of the [Player]. MAGIC_GOLD_PATCH
+     *
+     * @return uint32 mg
+     */
+    int GetMagicGold(Eluna* E, Player* player)
+    {
+        E->Push(player->GetMagicGold());
+        return 1;
+    }
+
+    /**
+     * Adds or removes Magic Gold. MAGIC_GOLD_PATCH
+     *
+     * A negative amount is a payment: it fails (returns false, nothing changes)
+     * when the balance does not cover it.
+     *
+     * @param int32 amount : positive to add, negative to spend
+     * @param bool announce = false : true = send a chat message about the change
+     * @return bool true when the balance changed
+     */
+    int ModifyMagicGold(Eluna* E, Player* player)
+    {
+        int32 amount = E->CHECKVAL<int32>(2);
+        bool announce = E->CHECKVAL<bool>(3, false);
+
+        E->Push(player->ModifyMagicGold(amount, announce));
+        return 1;
+    }
+
+    /**
+     * Sets the Magic Gold balance of the [Player]. MAGIC_GOLD_PATCH
+     *
+     * @param uint32 value : new balance (clamped to MagicGold.Max)
+     */
+    int SetMagicGold(Eluna* E, Player* player)
+    {
+        uint32 value = E->CHECKVAL<uint32>(2);
+
+        player->SetMagicGold(value);
+        return 0;
+    }
+
+    /**
+     * Returns the VIP level of the [Player]'s account (0..VIP.MaxLevel). VIP_PATCH
+     *
+     * @return uint8 vipLevel
+     */
+    int GetVIPLevel(Eluna* E, Player* player)
+    {
+        E->Push(player->GetEffectiveVIPLevel());
+        return 1;
+    }
+
+    /**
+     * Sets the VIP level of the account, effective immediately (level cap,
+     * loot chance, stealth detection, MG/XP/honor/reputation rates, chat color).
+     * VIP_PATCH
+     *
+     * @param uint8 level : new VIP level (0 = no VIP, higher values are clamped)
+     */
+    int SetVIPLevel(Eluna* E, Player* player)
+    {
+        uint8 level = E->CHECKVAL<uint8>(2);
+
+        player->SetVIPLevel(level);
         return 0;
     }
 
@@ -2265,6 +2370,33 @@ namespace LuaPlayer
 
         player->GetSession()->SendTrainerList(obj->GET_GUID());
         return 0;
+    }
+
+    /**
+     * Opens the character's own class trainer page, no NPC needed.
+     * PERSONAL_TRAINER_PATCH: lists every class spell the character can learn
+     * plus the weapon / shield skills of the class, like a real class trainer.
+     * Spells are bought with normal gold through the trainer window.
+     */
+    int SendClassTrainerList(Eluna* /*E*/, Player* player)
+    {
+        player->GetSession()->SendPersonalTrainerList();
+        return 0;
+    }
+
+    /**
+     * Returns the item entry an equipment slot currently SHOWS.
+     * ITEM_VISUAL_PATCH: the fake entry of an active morph (0 = the real item
+     * is shown). May be a synthetic display-only entry (>= 3000000000).
+     *
+     * @param uint8 slot : equipment slot (0-18)
+     * @return uint32 displayed item entry
+     */
+    int GetItemVisualOverrideEntry(Eluna* E, Player* player)
+    {
+        uint8 slot = E->CHECKVAL<uint8>(2);
+        E->Push(player->GetItemVisualOverrideEntry(slot));
+        return 1;
     }
 
     /**
@@ -4045,13 +4177,21 @@ namespace LuaPlayer
         { "KickPlayer", &LuaPlayer::KickPlayer },
         { "LogoutPlayer", &LuaPlayer::LogoutPlayer },
         { "SendTrainerList", &LuaPlayer::SendTrainerList },
+        { "SendClassTrainerList", &LuaPlayer::SendClassTrainerList },     // PERSONAL_TRAINER_PATCH
+        { "GetItemVisualOverrideEntry", &LuaPlayer::GetItemVisualOverrideEntry }, // ITEM_VISUAL_PATCH
         { "SendListInventory", &LuaPlayer::SendListInventory },
         { "ClearInventoryMenu", &LuaPlayer::ClearInventoryMenu }, // FAKE_INVENTORY_PATCH
         { "AddInventoryMenuItem", &LuaPlayer::AddInventoryMenuItem },
         { "SendInventoryMenu", &LuaPlayer::SendInventoryMenu },
+        { "BuyInventoryMenuItem", &LuaPlayer::BuyInventoryMenuItem },  // FAKE_INVENTORY_PATCH
         { "ItemMorph", &LuaPlayer::ItemMorph }, // ITEM_VISUAL_PATCH
         { "ItemMorphSlot", &LuaPlayer::ItemMorphSlot },
         { "ItemMorphReset", &LuaPlayer::ItemMorphReset },
+        { "GetMagicGold", &LuaPlayer::GetMagicGold },       // MAGIC_GOLD_PATCH
+        { "ModifyMagicGold", &LuaPlayer::ModifyMagicGold },
+        { "SetMagicGold", &LuaPlayer::SetMagicGold },
+        { "GetVIPLevel", &LuaPlayer::GetVIPLevel },         // VIP_PATCH
+        { "SetVIPLevel", &LuaPlayer::SetVIPLevel },
         { "SendShowBank", &LuaPlayer::SendShowBank },
         { "SendTabardVendorActivate", &LuaPlayer::SendTabardVendorActivate },
         { "SendSpiritResurrect", &LuaPlayer::SendSpiritResurrect },
